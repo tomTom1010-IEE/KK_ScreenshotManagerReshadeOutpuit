@@ -10,6 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="$(MSBuildThisFileDirectory)ScreenshotManager.KKEC.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)ScreenshotManager.OfflineExport.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)ScreenshotManager.KKEC.Hooks.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Renderers\AlphaShot2.cs" />
   </ItemGroup>

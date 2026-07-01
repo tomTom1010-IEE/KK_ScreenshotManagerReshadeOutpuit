@@ -473,6 +473,7 @@ namespace Screencap
             else if (KeyCapture360.Value.IsDown()) StartCoroutine(Take360Screenshot(false));
             else if (KeyCapture360in3D.Value.IsDown()) StartCoroutine(Take360Screenshot(true));
             else if (KeyCaptureRender.Value.IsDown()) StartCoroutine(TakeRenderScreenshot(false));
+            else if (KeyExportOfflineReShade != null && KeyExportOfflineReShade.Value.IsDown()) StartCoroutine(TakeOfflineReShadeExportScreenshot());
             else if (KeyCaptureAlphaIn3D.Value.IsDown()) StartCoroutine(TakeRenderScreenshot(true));
         }
 

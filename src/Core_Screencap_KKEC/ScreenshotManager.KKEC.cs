@@ -20,6 +20,7 @@ namespace Screencap
         private void InitializeGameSpecific()
         {
             SceneManager.sceneLoaded += (s, a) => InstallSceenshotHandler();
+            InitializeOfflineReShadeExport();
             InstallSceenshotHandler();
 
             CardDownscalingRate = Config.Bind(

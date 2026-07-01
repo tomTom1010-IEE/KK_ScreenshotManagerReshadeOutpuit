@@ -1,0 +1,2034 @@
+﻿using Studio;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using BepInEx.Logging;
+using ToolBox;
+using ToolBox.Extensions;
+using UnityEngine;
+using VideoExport.AudioPlugins;
+using VideoExport.VideoExtensions;
+using VideoExport.AudioCodecs;
+using VideoExport.ScreenshotPlugins;
+using Resources = UnityEngine.Resources;
+using VideoExport.Core;
+using KKAPI.Studio.UI.Toolbars;
+using KKAPI.Utilities;
+using TimelineCompatibility = ToolBox.TimelineCompatibility;
+#if (!KOIKATSU || SUNSHINE)
+using Unity.Collections;
+using UnityEngine.Rendering;
+using System.Collections.Concurrent;
+using System.Threading;
+#else
+using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+#endif
+
+using BepInEx;
+using BepInEx.Configuration;
+using HarmonyLib;
+using System.Text.RegularExpressions;
+
+namespace VideoExport
+{
+#if BEPINEX
+    [BepInPlugin(GUID: GUID, Name: Name, Version: Version)]
+#if KOIKATSU
+    [BepInProcess("CharaStudio")]
+#elif AISHOUJO || HONEYSELECT2
+    [BepInProcess("StudioNEOV2")]
+#endif
+    [BepInDependency(Screencap.ScreenshotManager.GUID, Screencap.ScreenshotManager.Version)]
+    [BepInDependency(KKAPI.KoikatuAPI.GUID, KKAPI.KoikatuAPI.VersionConst)]
+#endif
+    public partial class VideoExport : GenericPlugin
+    {
+        public const string Version = "2.0.3";
+        public const string GUID = "com.joan6694.illusionplugins.videoexport";
+        public const string Name = "VideoExport";
+
+        #region Types
+        public enum ImgFormat
+        {
+            BMP,
+            PNG,
+            JPG,
+#if !HONEYSELECT //Someday I hope...
+            EXR
+#endif
+        }
+
+        private enum Language
+        {
+            English,
+            中文 // Chinese
+        }
+
+        private enum LimitDurationType
+        {
+            Frames,
+            Seconds,
+            Animation,
+            Timeline
+        }
+
+        private enum UpdateDynamicBonesType
+        {
+            Default,
+            EveryFrame
+        }
+        #endregion
+
+        #region Private Variables
+        internal static new ManualLogSource Logger;
+
+        internal static string _pluginFolder;
+        private ConfigEntry<string> _outputFolder;
+        private ConfigEntry<string> _globalFramesFolder;
+        internal static GenericConfig _configFile;
+        private static readonly TranslationDictionary<TranslationKey> _englishDictionary = new TranslationDictionary<TranslationKey>("VideoExport.Resources.English.xml");
+        private static readonly TranslationDictionary<TranslationKey> _chineseDictionary = new TranslationDictionary<TranslationKey>("VideoExport.Resources.中文.xml");
+        internal static TranslationDictionary<TranslationKey> _currentDictionary = _englishDictionary;
+        private static readonly GUIStyle _customBoxStyle = new GUIStyle { normal = new GUIStyleState { background = Texture2D.whiteTexture } };
+
+        private string[] _limitDurationNames;
+        private string[] _extensionsNames;
+        private string[] _updateDynamicBonesTypeNames;
+
+        private static bool _showUI = false;
+        private static SimpleToolbarToggle _toolbarButton;
+        private bool _isRecording = false;
+        private bool _breakRecording = false;
+        private bool _generatingVideo = false;
+        private readonly List<IScreenshotPlugin> _screenshotPlugins = new List<IScreenshotPlugin>();
+        private const int _uniqueId = ('V' << 24) | ('I' << 16) | ('D' << 8) | 'E';
+        private Rect _windowRect = new Rect(Screen.width / 2 - 320, 100, Styles.WindowWidth, 10);
+        private static RectTransform _imguiBackground;
+        private string _currentMessage;
+        private readonly List<IVideoExtension> _extensions = new List<IVideoExtension>();
+        private Color _messageColor = Color.white;
+        private float _progressBarPercentage;
+        private bool _startOnNextClick = false;
+        private Animator _currentAnimator;
+        private float _lastAnimationNormalizedTime;
+        private bool _animationIsPlaying;
+        private int _currentRecordingFrame;
+        private double _currentRecordingTime;
+        private int _recordingFrameLimit;
+        private bool _timelinePresent = false;
+        private float _realTimelineDuration;
+
+        private int _selectedPlugin = 0;
+        private int _fps = 60;
+        private int _exportFps = 60;
+        private readonly int[] _presetFps = new[] { 12, 24, 30, 60, 120 };
+        private bool _autoGenerateVideo;
+        private bool _limitDuration;
+        private LimitDurationType _selectedLimitDuration;
+        private float _limitDurationNumber = 600;
+        private ExtensionsType _selectedExtension;
+        private bool _resize;
+        private int _resizeX;
+        private int _resizeY;
+        private UpdateDynamicBonesType _selectedUpdateDynamicBones;
+        private bool _realignTimeline = true;
+        private int _prewarmLoopCount = 3;
+        private bool _closeWhenDone;
+        private bool _parallelScreenshotEncoding;
+        private ConfigEntry<Language> _language;
+
+        private bool _showTooltips = true;
+        private bool _showCaptureSection;
+        private bool _showVideoSection;
+        private bool _showOtherSection;
+        private bool _exportFpsSameAsCapture = true;
+
+        private Process _ffmpegProcessMaster;
+        private Process _ffmpegProcessSlave;
+        private BinaryWriter _ffmpegStdin;
+#if (!KOIKATSU || SUNSHINE)
+        // Set when capture has fed all frames so the async writer can close ffmpeg's stdin without waiting
+        // for _isRecording (cleared only after the blocking WaitForFFmpegExit). Avoids a deadlock.
+        private volatile bool _ffmpegInputComplete;
+#endif
+        private byte[] _frameDataBuffer;
+        private int _frameBufferSize;
+        private string _tempDateTime;
+        private TimeSpan _elapsedRenderTime = TimeSpan.Zero;
+
+#if (!KOIKATSU || SUNSHINE)
+        private int _asyncGPURequestCount = 0;
+        private int _asyncGPUCompleteCount = 0;
+        private ConcurrentQueue<SimpleFrameData> _ffmpegMasterFrameQueue = new ConcurrentQueue<SimpleFrameData>();
+        private SortedList<long, byte[]> _reorderBuffer = new SortedList<long, byte[]>();
+        private Thread _ffmpegMasterThread;
+        private AutoResetEvent _ffmpegMasterFrameSignal = new AutoResetEvent(false);
+        private SimpleBytePool _simpleBytePool;
+        private int _simpleBytePoolSize = 10;
+        private long _frameCount = 0;
+        private long _nextFrameToProcess = 0;
+#endif
+
+        #endregion
+
+        #region Public Accessors (for other plugins probably)
+        public bool isRecording { get { return _isRecording; } }
+        public int currentRecordingFrame { get { return _currentRecordingFrame; } }
+        public double currentRecordingTime { get { return _currentRecordingTime; } }
+        public int recordingFrameLimit { get { return _recordingFrameLimit; } }
+        #endregion
+
+        internal static ConfigEntry<KeyboardShortcut> ConfigMainWindowShortcut { get; private set; }
+        internal static ConfigEntry<KeyboardShortcut> ConfigStartStopShortcut { get; private set; }
+
+        public static bool ShowUI
+        {
+            get => _showUI;
+            set
+            {
+                if (_showUI != value)
+                {
+                    _showUI = value;
+                    _toolbarButton.Toggled.OnNext(value);
+
+                    if (_imguiBackground == null)
+                        _imguiBackground = IMGUIExtensions.CreateUGUIPanelForIMGUI();
+                }
+            }
+        }
+
+        #region Unity Methods
+        protected override void Awake()
+        {
+            base.Awake();
+
+            Logger = base.Logger;
+
+            ConfigMainWindowShortcut = Config.Bind("Config", "Open VideoExport UI", new KeyboardShortcut(KeyCode.E, KeyCode.LeftControl));
+            ConfigStartStopShortcut = Config.Bind("Config", "Start or Stop Recording", new KeyboardShortcut(KeyCode.E, KeyCode.LeftControl, KeyCode.LeftShift));
+
+            _pluginFolder = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), Name);
+
+            var harmony = HarmonyExtensions.CreateInstance(GUID);
+
+            _configFile = new GenericConfig(Name, this);
+            _selectedPlugin = _configFile.AddInt("selectedScreenshotPlugin", 0, true);
+            _fps = _configFile.AddInt("framerate", 60, true);
+            _exportFps = _configFile.AddInt("exportFramerate", 60, true);
+            _autoGenerateVideo = _configFile.AddBool("autoGenerateVideo", true, true);
+            _limitDuration = _configFile.AddBool("limitDuration", false, true);
+            _selectedLimitDuration = (LimitDurationType)_configFile.AddInt("selectedLimitDurationType", (int)LimitDurationType.Frames, true);
+            _limitDurationNumber = _configFile.AddFloat("limitDurationNumber", 0, true);
+            _selectedExtension = (ExtensionsType)_configFile.AddInt("selectedExtension", (int)ExtensionsType.MP4, true);
+            _resize = _configFile.AddBool("resize", false, true);
+            _resizeX = _configFile.AddInt("resizeX", Screen.width, true);
+            _resizeY = _configFile.AddInt("resizeY", Screen.height, true);
+            _selectedUpdateDynamicBones = (UpdateDynamicBonesType)_configFile.AddInt("selectedUpdateDynamicBonesMode", (int)UpdateDynamicBonesType.Default, true);
+            _realignTimeline = _configFile.AddBool("realignTimeline", true, true);
+            _prewarmLoopCount = _configFile.AddInt("prewarmLoopCount", 3, true);
+            _showCaptureSection = _configFile.AddBool("showCaptureSection", true, true);
+            _showVideoSection = _configFile.AddBool("showVideoSection", true, true);
+            _showOtherSection = _configFile.AddBool("showOtherSection", true, true);
+            _showTooltips = _configFile.AddBool("showTooltips", true, true);
+            _parallelScreenshotEncoding = _configFile.AddBool("parallelScreenshotEncoding", false, true);
+            _language = Config.Bind(Name, "Language", Language.English, "Interface language");
+            _language.SettingChanged += (sender, args) => SetLanguage(_language.Value);
+            _includeAudio = _configFile.AddBool("includeAudio", true, true);
+            _selectedCodec = _configFile.AddInt("selectedCodec", 0, true);
+            _exportSampleRate = _configFile.AddInt("exportSampleRate", 44100, true);
+            SetLanguage(_language.Value);
+
+            // If old directories exist, keep using them by default, otherwise use the new defaults
+            var outputFolderDefault = Path.Combine(_pluginFolder, "Output");
+            if (!Directory.Exists(outputFolderDefault)) outputFolderDefault = Path.Combine(Paths.GameRootPath, "UserData\\VideoExport\\Output");
+            _outputFolder = Config.Bind("VideoExport", "outputFolder", outputFolderDefault, new ConfigDescription(_currentDictionary.GetString(TranslationKey.VideosFolderDesc)));
+
+            var framesFolderDefault = Path.Combine(_pluginFolder, "Frames");
+            if (!Directory.Exists(framesFolderDefault)) framesFolderDefault = Path.Combine(Paths.GameRootPath, "UserData\\VideoExport\\Frames");
+            _globalFramesFolder = Config.Bind("VideoExport", "framesFolder", framesFolderDefault, new ConfigDescription(_currentDictionary.GetString(TranslationKey.FramesFolderDesc)));
+
+            _extensions.Add(new MP4Extension());
+            _extensions.Add(new WEBMExtension());
+            _extensions.Add(new GIFExtension());
+            _extensions.Add(new MOVExtension());
+            _extensions.Add(new WEBPExtension());
+            _extensions.Add(new AVIFExtension());
+            _extensions.Add(new MKVExtension());
+
+            _extensionsNames = Enum.GetNames(typeof(ExtensionsType));
+            if ((int)_selectedExtension >= _extensionsNames.Length)
+                _selectedExtension = ExtensionsType.MP4;
+
+            InitAudio();
+
+            _timelinePresent = TimelineCompatibility.Init();
+
+            this.ExecuteDelayed(() =>
+            {
+                AddScreenshotPlugin<ScreencapPlugin>(harmony);
+                AddScreenshotPlugin<Builtin>(harmony);
+                AddScreenshotPlugin<ReshadePlugin>(harmony);
+#if !KOIKATSU
+                AddScreenshotPlugin<Win32Plugin>(harmony);
+#endif
+#if DEBUG
+                AddAudioPlugin(new DummyPlugin(), out _);
+#endif
+
+                if (_screenshotPlugins.Count == 0)
+                    Logger.LogError("No compatible screenshot plugin found, please install one.");
+
+                SetLanguage(_language.Value);
+
+                if (_selectedPlugin < 0 || _selectedPlugin >= _screenshotPlugins.Count)
+                {
+                    // Panic reset: out of bounds if user has Reshade selected and uninstalls Reshade
+                    _selectedPlugin = 0;
+                }
+            }, 5);
+
+            _toolbarButton = new SimpleToolbarToggle(
+                "Open window",
+                "Open VideoExport window. It can be used\nto record at high resolution and stable FPS.\nHotkey: " + ConfigMainWindowShortcut.Value,
+                () => ResourceUtils.GetEmbeddedResource("ve_toolbar_icon.png", typeof(VideoExport).Assembly).LoadTexture(),
+                false, this, val => ShowUI = val);
+            ToolbarManager.AddLeftToolbarControl(_toolbarButton);
+        }
+
+        protected override void Update()
+        {
+            if (ConfigStartStopShortcut.Value.IsDown())
+            {
+                if (_isRecording == false)
+                    RecordVideo();
+                else
+                    StopRecording();
+            }
+            else if (ConfigMainWindowShortcut.Value.IsDown())
+            {
+                ShowUI = !ShowUI;
+            }
+            if (_startOnNextClick && Input.GetMouseButtonDown(0))
+            {
+                RecordVideo();
+                _startOnNextClick = false;
+            }
+            TreeNodeObject treeNode = Studio.Studio.Instance?.treeNodeCtrl.selectNode;
+            _currentAnimator = null;
+            if (treeNode != null)
+            {
+                ObjectCtrlInfo info;
+                if (Studio.Studio.Instance.dicInfo.TryGetValue(treeNode, out info))
+                    _currentAnimator = info.guideObject.transformTarget.GetComponentInChildren<Animator>();
+            }
+
+            if (_currentAnimator == null && _selectedLimitDuration == LimitDurationType.Animation)
+                _selectedLimitDuration = LimitDurationType.Seconds;
+            if (_timelinePresent == false && _selectedLimitDuration == LimitDurationType.Timeline)
+                _selectedLimitDuration = LimitDurationType.Seconds;
+        }
+
+        protected override void LateUpdate()
+        {
+            if (_currentAnimator != null)
+            {
+                AnimatorStateInfo stateInfo = _currentAnimator.GetCurrentAnimatorStateInfo(0);
+                _animationIsPlaying = stateInfo.normalizedTime > _lastAnimationNormalizedTime;
+                if (stateInfo.loop == false)
+                    _animationIsPlaying = _animationIsPlaying && stateInfo.normalizedTime < 1f;
+                _lastAnimationNormalizedTime = stateInfo.normalizedTime;
+            }
+            if (_imguiBackground != null)
+            {
+                if (ShowUI)
+                {
+                    _imguiBackground.gameObject.SetActive(true);
+                    IMGUIExtensions.FitRectTransformToRect(_imguiBackground, _windowRect);
+                }
+                else if (_imguiBackground != null)
+                    _imguiBackground.gameObject.SetActive(false);
+            }
+            if (ShowUI)
+            {
+                _windowRect.height = 10f;
+            }
+        }
+
+        protected override void OnGUI()
+        {
+            if (ShowUI == false)
+                return;
+
+            Styles.BeginVESkin();
+            GUIStyle windowStyle = Styles.WindowStyle ?? GUI.skin.window;
+            _windowRect = GUILayout.Window(_uniqueId + 1, _windowRect, Window, "Video Export " + Version, windowStyle);
+            Styles.EndVESkin();
+        }
+
+        protected override void OnDestroy()
+        {
+            base.OnDestroy();
+            _configFile.SetInt("selectedScreenshotPlugin", _selectedPlugin);
+            _configFile.SetInt("framerate", _fps);
+            _configFile.SetInt("exportFramerate", _exportFps);
+            _configFile.SetBool("autoGenerateVideo", _autoGenerateVideo);
+            _configFile.SetBool("limitDuration", _limitDuration);
+            _configFile.SetInt("selectedLimitDurationType", (int)_selectedLimitDuration);
+            _configFile.SetFloat("limitDurationNumber", _limitDurationNumber);
+            _configFile.SetInt("selectedExtension", (int)_selectedExtension);
+            _configFile.SetBool("resize", _resize);
+            _configFile.SetInt("resizeX", _resizeX);
+            _configFile.SetInt("resizeY", _resizeY);
+            _configFile.SetInt("selectedUpdateDynamicBonesMode", (int)_selectedUpdateDynamicBones);
+            _configFile.SetBool("realignTimeline", _realignTimeline);
+            _configFile.SetInt("prewarmLoopCount", _prewarmLoopCount);
+            _configFile.SetBool("showCaptureSection", _showCaptureSection);
+            _configFile.SetBool("showVideoSection", _showVideoSection);
+            _configFile.SetBool("showOtherSection", _showOtherSection);
+            _configFile.SetBool("showTooltips", _showTooltips);
+            _configFile.SetBool("parallelScreenshotEncoding", _parallelScreenshotEncoding);
+            foreach (IScreenshotPlugin plugin in _screenshotPlugins)
+                plugin.SaveParams();
+            foreach (IVideoExtension extension in _extensions)
+                extension.SaveParams();
+            SaveAudioConfig();
+            _configFile.Save();
+        }
+        #endregion
+
+        #region Public Methods
+        /// <summary>
+        /// Start video recording.
+        /// </summary>
+        public void RecordVideo()
+        {
+            if (_isRecording == false)
+                StartCoroutine(RecordVideo_Routine_Safe());
+        }
+
+        /// <summary>
+        /// Stop video recording. Does not stop immediately, only once it's safe to do so.
+        /// </summary>
+        public void StopRecording()
+        {
+            _breakRecording = true;
+        }
+
+        #endregion
+
+        #region Private Methods
+        private void AddScreenshotPlugin<T>(Harmony harmony) where T : IScreenshotPlugin, new()
+        {
+            try
+            {
+                var plugin = new T();
+                if (plugin.Init(harmony))
+                    _screenshotPlugins.Add(plugin);
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("Couldn't add screenshot plugin " + typeof(T).FullName + ".\n" + e);
+            }
+        }
+
+        private void LimitCount()
+        {
+            switch (_selectedLimitDuration)
+            {
+                case LimitDurationType.Frames:
+                    {
+                        GUILayout.BeginHorizontal();
+                        {
+                            GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.LimitByLimitCount), _currentDictionary.GetString(TranslationKey.LimitByLimitCountTooltip).Replace("\\n", "\n")), GUILayout.ExpandWidth(false));
+                            string s = GUILayout.TextField(_limitDurationNumber.ToString("0"));
+                            int res;
+                            if (int.TryParse(s, out res) == false || res < 1)
+                                res = 1;
+                            _limitDurationNumber = res;
+                        }
+                        GUILayout.EndHorizontal();
+
+                        float totalSeconds = _limitDurationNumber / _fps;
+                        GUILayout.Label($"{totalSeconds:0.0000} {_currentDictionary.GetString(TranslationKey.Seconds)}, {Mathf.RoundToInt(_limitDurationNumber)} {_currentDictionary.GetString(TranslationKey.Frames)}");
+
+                        break;
+                    }
+                case LimitDurationType.Seconds:
+                    {
+                        GUILayout.BeginHorizontal();
+                        {
+                            GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.LimitByLimitCount), _currentDictionary.GetString(TranslationKey.LimitByLimitCountTooltip).Replace("\\n", "\n")), GUILayout.ExpandWidth(false));
+                            string s = GUILayout.TextField(_limitDurationNumber.ToString("0.000"));
+                            float res;
+                            if (float.TryParse(s, out res) == false || res <= 0f)
+                                res = 0.001f;
+                            _limitDurationNumber = res;
+                        }
+                        GUILayout.EndHorizontal();
+
+                        float totalFrames = _limitDurationNumber * _fps;
+                        GUILayout.Label($"{_limitDurationNumber:0.0000} {_currentDictionary.GetString(TranslationKey.Seconds)}, {Mathf.RoundToInt(totalFrames)} {_currentDictionary.GetString(TranslationKey.Frames)} ({totalFrames:0.000})");
+
+                        break;
+                    }
+                case LimitDurationType.Animation:
+                    {
+                        GUILayout.BeginHorizontal();
+                        {
+                            GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.LimitByPrewarmLoopCount), _currentDictionary.GetString(TranslationKey.LimitByPrewarmLoopCountTooltip).Replace("\\n", "\n")), GUILayout.ExpandWidth(false));
+                            string s = GUILayout.TextField(_prewarmLoopCount.ToString());
+                            int res;
+                            if (int.TryParse(s, out res) == false || res < 0)
+                                res = 1;
+                            _prewarmLoopCount = res;
+                        }
+                        GUILayout.EndHorizontal();
+
+                        GUILayout.BeginHorizontal();
+                        {
+                            GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.LimitByLoopsToRecord), _currentDictionary.GetString(TranslationKey.LimitByLoopsToRecordTooltip).Replace("\\n", "\n")), GUILayout.ExpandWidth(false));
+                            string s = GUILayout.TextField(_limitDurationNumber.ToString("0.000"));
+                            float res;
+                            if (float.TryParse(s, out res) == false || res <= 0)
+                                res = 0.001f;
+                            _limitDurationNumber = res;
+                        }
+                        GUILayout.EndHorizontal();
+
+                        if (_currentAnimator != null)
+                        {
+                            AnimatorStateInfo info = _currentAnimator.GetCurrentAnimatorStateInfo(0);
+                            float totalLength = info.length * _limitDurationNumber;
+                            float totalFrames = totalLength * _fps;
+                            GUILayout.Label($"{totalLength:0.0000} {_currentDictionary.GetString(TranslationKey.Seconds)}, {Mathf.RoundToInt(totalFrames)} {_currentDictionary.GetString(TranslationKey.Frames)} ({totalFrames:0.000})");
+                        }
+                        break;
+                    }
+                case LimitDurationType.Timeline:
+                    {
+                        GUILayout.BeginHorizontal();
+                        {
+                            _realignTimeline = GUILayout.Toggle(_realignTimeline, new GUIContent(_currentDictionary.GetString(TranslationKey.RealignTimeline), _currentDictionary.GetString(TranslationKey.RealignTimelineTooltip).Replace("\\n", "\n")));
+                        }
+                        GUILayout.EndHorizontal();
+
+                        GUILayout.BeginHorizontal();
+                        {
+
+                            GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.LimitByPrewarmLoopCount), _currentDictionary.GetString(TranslationKey.LimitByPrewarmLoopCountTooltip).Replace("\\n", "\n")), GUILayout.ExpandWidth(false));
+                            int.TryParse(GUILayout.TextField(_prewarmLoopCount.ToString()), out _prewarmLoopCount);
+                        }
+                        GUILayout.EndHorizontal();
+
+                        GUILayout.BeginHorizontal();
+                        {
+                            GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.LimitByLoopsToRecord), _currentDictionary.GetString(TranslationKey.LimitByLoopsToRecordTooltip).Replace("\\n", "\n")), GUILayout.ExpandWidth(false));
+                            string s = GUILayout.TextField(_limitDurationNumber.ToString("0.000"));
+                            float res;
+                            if (float.TryParse(s, out res) == false || res <= 0)
+                                res = 0.001f;
+                            _limitDurationNumber = res;
+                        }
+                        GUILayout.EndHorizontal();
+
+                        if (_timelinePresent)
+                        {
+                            if (!_isRecording)
+                                _realTimelineDuration = TimelineCompatibility.EstimateRealDuration();
+
+                            float totalLength = _realTimelineDuration * _limitDurationNumber;
+                            float totalFrames = totalLength * _fps;
+                            GUILayout.Label($"{totalLength:0.0000} {_currentDictionary.GetString(TranslationKey.Seconds)}, {Mathf.RoundToInt(totalFrames)} {_currentDictionary.GetString(TranslationKey.Frames)} ({totalFrames:0.000})");
+                        }
+                        break;
+                    }
+            }
+        }
+
+        private void WindowCaptureSection()
+        {
+            IScreenshotPlugin plugin = _screenshotPlugins[(int)_selectedPlugin];
+
+            GUILayout.BeginVertical("Box");
+            {
+                GUILayout.BeginHorizontal(Styles.headerStyle);
+                {
+                    GUILayout.Space(30);
+                    GUI.backgroundColor = Color.gray;
+                    GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.CaptureSettingsHeading)), Styles.SectionLabelStyle);
+                    if (GUILayout.Button(_showCaptureSection ? "▲" : "▼", GUILayout.Width(30)))
+                    {
+                        _showCaptureSection = !_showCaptureSection;
+                    }
+                    GUI.backgroundColor = Color.white;
+                }
+                GUILayout.EndHorizontal();
+                if (!_showCaptureSection)
+                {
+                    GUILayout.EndVertical();
+                    return;
+                }
+
+                Vector2 currentSize = plugin.currentSize;
+                GUILayout.BeginHorizontal();
+                {
+                    GUILayout.Label($"{_currentDictionary.GetString(TranslationKey.CurrentSize)}: {currentSize.x:#}x{currentSize.y:#}");
+                    GUILayout.FlexibleSpace();
+
+                }
+                GUILayout.EndHorizontal();
+                GUILayout.BeginVertical(Styles.EmptyBoxStyle);
+                {
+                    GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.ScreenshotTool),
+                        _currentDictionary.GetString(TranslationKey.ScreenshotToolTooltip).Replace("\\n", "\n")));
+
+                    GUILayout.BeginHorizontal();
+                    {
+                        GUILayout.BeginVertical(GUILayout.Width(Styles.WindowWidth / 3));
+                        {
+                            _selectedPlugin = GUILayout.SelectionGrid(_selectedPlugin,
+                                _screenshotPlugins.Select(p => p.name).ToArray(), 1);
+                        }
+                        GUILayout.EndVertical();
+
+                        GUILayout.BeginVertical(Styles.BoxStyle);
+                        {
+                            plugin.DisplayParams();
+                        }
+                        GUILayout.EndVertical();
+                    }
+                    GUILayout.EndHorizontal();
+                }
+                GUILayout.EndVertical();
+
+                GUILayout.BeginVertical(Styles.EmptyBoxStyle);
+                {
+                    GUILayout.BeginHorizontal();
+                    {
+                        GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.Framerate), _currentDictionary.GetString(TranslationKey.FramerateTooltip).Replace("\\n", "\n")));
+
+                        if (GUILayout.Button("12", Styles.ButtonStyle, GUILayout.Width(35)))
+                        {
+                            _fps = 12;
+                        }
+                        if (GUILayout.Button("24", Styles.ButtonStyle, GUILayout.Width(35)))
+                        {
+                            _fps = 24;
+                        }
+                        if (GUILayout.Button("30", Styles.ButtonStyle, GUILayout.Width(35)))
+                        {
+                            _fps = 30;
+                        }
+                        if (GUILayout.Button("60", Styles.ButtonStyle, GUILayout.Width(35)))
+                        {
+                            _fps = 60;
+                        }
+                        if (GUILayout.Button("120", Styles.ButtonStyle, GUILayout.Width(35)))
+                        {
+                            _fps = 120;
+                        }
+
+                        if (GUILayout.Button("-", GUILayout.Width(30)))
+                        {
+                            int index = Array.BinarySearch(_presetFps, _fps);
+                            if (index < 0)
+                                index = ~index;
+                            _fps = _presetFps[Math.Max(0, index - 1)];
+                        }
+                        string fpsString = GUILayout.TextField(_fps.ToString(), GUILayout.Width(50), GUILayout.Height(30));
+                        if (int.TryParse(fpsString, out int res))
+                            _fps = Mathf.Clamp(res, 1, 10000);
+
+                        if (GUILayout.Button("+", GUILayout.Width(30)))
+                        {
+                            int index = Array.BinarySearch(_presetFps, _fps);
+                            if (index < 0)
+                                index = ~index;
+                            _fps = _presetFps[Math.Min(_presetFps.Length - 1, index + 1)];
+                        }
+                    }
+                    GUILayout.EndHorizontal();
+
+                    GUILayout.BeginHorizontal();
+                    {
+                        GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.ExportFramerate),
+                            _currentDictionary.GetString(TranslationKey.ExportFramerateTooltip).Replace("\\n", "\n")));
+                        GUILayout.FlexibleSpace();
+                        _exportFpsSameAsCapture = GUILayout.Toggle(_exportFpsSameAsCapture,
+                            _currentDictionary.GetString(TranslationKey.SameAsCapture));
+                    }
+                    GUILayout.EndHorizontal();
+
+                    if (_exportFpsSameAsCapture)
+                    {
+                        _exportFps = _fps;
+                    }
+                    else
+                    {
+                        GUILayout.BeginHorizontal();
+                        {
+                            GUILayout.Label("");
+                            int[] quickPresets = { 12, 24, 30, 60, 120 };
+
+                            foreach (int preset in quickPresets)
+                            {
+                                GUI.enabled = preset <= _fps;
+                                if (GUILayout.Button(preset.ToString(), GUILayout.Width(35)))
+                                {
+                                    _exportFps = preset;
+                                }
+                            }
+
+                            GUI.enabled = true;
+
+                            if (GUILayout.Button("-", GUILayout.Width(30)))
+                            {
+                                int index = Array.BinarySearch(_presetFps, _exportFps);
+                                if (index < 0)
+                                    index = ~index;
+                                _exportFps = _presetFps[Math.Max(0, index - 1)];
+                            }
+
+                            string exportFpsString = GUILayout.TextField(_exportFps.ToString(), GUILayout.Width(50));
+                            if (int.TryParse(exportFpsString, out int res))
+                                _exportFps = Mathf.Clamp(res, 1, _fps);
+
+                            if (GUILayout.Button("+", GUILayout.Width(30)))
+                            {
+                                int index = Array.BinarySearch(_presetFps, _exportFps);
+                                if (index < 0)
+                                    index = ~index;
+                                int newFps = _presetFps[Math.Min(_presetFps.Length - 1, index + 1)];
+                                _exportFps = Mathf.Min(newFps, _fps);
+                            }
+                        }
+                        GUILayout.EndHorizontal();
+                    }
+                    GUILayout.BeginHorizontal();
+                    {
+                        GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.DBUpdateMode), _currentDictionary.GetString(TranslationKey.DBUpdateModeTooltip).Replace("\\n", "\n")));
+                        _selectedUpdateDynamicBones = (UpdateDynamicBonesType)GUILayout.SelectionGrid((int)_selectedUpdateDynamicBones, _updateDynamicBonesTypeNames, 2);
+                    }
+                    GUILayout.EndHorizontal();
+
+                }
+                GUILayout.EndVertical();
+
+                GUILayout.BeginVertical(Styles.EmptyBoxStyle);
+                {
+                    GUILayout.BeginVertical();
+                    {
+                        _limitDuration = GUILayout.Toggle(_limitDuration, new GUIContent(_currentDictionary.GetString(TranslationKey.LimitBy), _currentDictionary.GetString(TranslationKey.LimitByTooltip).Replace("\\n", "\n")));
+                        if (_limitDuration)
+                        {
+                            _selectedLimitDuration = (LimitDurationType)GUILayout.SelectionGrid((int)_selectedLimitDuration, _limitDurationNames, 4);
+                            GUILayout.Space(5);
+                            LimitCount();
+                        }
+                    }
+                    GUILayout.EndVertical();
+                }
+                GUILayout.EndVertical();
+            }
+            GUILayout.EndVertical();
+        }
+
+        private void WindowVideoSection()
+        {
+            IScreenshotPlugin plugin = _screenshotPlugins[(int)_selectedPlugin];
+            IVideoExtension extension = _extensions[(int)_selectedExtension];
+            bool prevGuiEnabled;
+            Vector2 currentSize = plugin.currentSize;
+
+            GUILayout.BeginVertical("Box");
+            {
+                GUILayout.BeginHorizontal(Styles.headerStyle);
+                {
+                    GUILayout.Space(30);
+                    GUI.backgroundColor = Color.gray;
+                    GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.VideoSettingsHeading)), Styles.SectionLabelStyle);
+                    if (GUILayout.Button(_showVideoSection ? "▲" : "▼", GUILayout.Width(30)))
+                    {
+                        _showVideoSection = !_showVideoSection;
+                    }
+                    GUI.backgroundColor = Color.white;
+                }
+                GUILayout.EndHorizontal();
+                if (!_showVideoSection)
+                {
+                    GUILayout.EndVertical();
+                    return;
+                }
+
+                GUILayout.BeginHorizontal(Styles.EmptyBoxStyle);
+                {
+                    _autoGenerateVideo = GUILayout.Toggle(_autoGenerateVideo, new GUIContent(_currentDictionary.GetString(TranslationKey.CreateVideo)));
+                    if (!_autoGenerateVideo)
+                    {
+                        GUILayout.EndHorizontal();
+                        GUILayout.EndVertical();
+                        return;
+                    }
+
+                    GUILayout.FlexibleSpace();
+
+                    GUILayout.BeginHorizontal();
+                    {
+                        _resize = GUILayout.Toggle(_resize, _currentDictionary.GetString(TranslationKey.Resize), GUILayout.ExpandWidth(false));
+                        prevGuiEnabled = GUI.enabled;
+                        GUI.enabled = _resize && prevGuiEnabled;
+
+                        string s = GUILayout.TextField(_resizeX.ToString(), GUILayout.Width(50));
+                        int res;
+                        if (int.TryParse(s, out res) == false || res < 1)
+                            res = 1;
+                        _resizeX = res;
+
+                        s = GUILayout.TextField(_resizeY.ToString(), GUILayout.Width(50));
+                        if (int.TryParse(s, out res) == false || res < 1)
+                            res = 1;
+                        _resizeY = res;
+
+                        if (GUILayout.Button("Default", Styles.SmallButtonStyle, GUILayout.ExpandWidth(false), GUILayout.Height(25)))
+                        {
+                            _resizeX = Screen.width;
+                            _resizeY = Screen.height;
+                        }
+                        if (_resizeX > currentSize.x)
+                            _resizeX = (int)currentSize.x;
+                        if (_resizeY > currentSize.y)
+                            _resizeY = (int)currentSize.y;
+
+                        GUI.enabled = prevGuiEnabled;
+                    }
+                    GUILayout.EndHorizontal();
+                }
+                GUILayout.EndHorizontal();
+
+                GUILayout.BeginHorizontal();
+                {
+                    GUILayout.BeginVertical(GUILayout.Width(Styles.WindowWidth / 5));
+                    {
+                        GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.Extension), _currentDictionary.GetString(TranslationKey.ExtensionTooltip).Replace("\\n", "\n")), Styles.CenteredLabelStyle);
+                        _selectedExtension = (ExtensionsType)GUILayout.SelectionGrid((int)_selectedExtension, _extensionsNames, 1);
+                    }
+                    GUILayout.EndVertical();
+
+                    GUILayout.BeginVertical(Styles.BoxStyle);
+                    extension.DisplayParams();
+                    GUILayout.EndVertical();
+                }
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.EndVertical();
+        }
+
+        void WindowOtherSection()
+        {
+            GUILayout.BeginVertical("Box");
+            {
+                GUILayout.BeginHorizontal(Styles.headerStyle);
+                {
+                    GUILayout.Space(30);
+                    GUI.backgroundColor = Color.gray;
+                    GUILayout.Label(new GUIContent(_currentDictionary.GetString(TranslationKey.OtherSettingsHeading)), Styles.SectionLabelStyle);
+                    if (GUILayout.Button(_showOtherSection ? "▲" : "▼", GUILayout.Width(30)))
+                    {
+                        _showOtherSection = !_showOtherSection;
+                    }
+                    GUI.backgroundColor = Color.white;
+                }
+                GUILayout.EndHorizontal();
+                if (!_showOtherSection)
+                {
+                    GUILayout.EndVertical();
+                    return;
+                }
+
+                GUILayout.BeginHorizontal(Styles.EmptyBoxStyle);
+                {
+                    _closeWhenDone = GUILayout.Toggle(_closeWhenDone, _currentDictionary.GetString(TranslationKey.CloseStudio), Styles.DangerToggleStyle);
+                    GUILayout.Space(25);
+                    _showTooltips = GUILayout.Toggle(_showTooltips, _currentDictionary.GetString(TranslationKey.ShowTooltips));
+                }
+                GUILayout.EndHorizontal();
+            }
+            GUILayout.EndVertical();
+        }
+
+        private void WindowRecordSection()
+        {
+            IScreenshotPlugin plugin = _screenshotPlugins[(int)_selectedPlugin];
+            IVideoExtension extension = _extensions[(int)_selectedExtension];
+
+            bool prevGuiEnabled = GUI.enabled;
+            GUILayout.BeginHorizontal(Styles.EmptyBoxStyle);
+
+            GUI.enabled = _generatingVideo == false && _startOnNextClick == false &&
+                          (_limitDuration == false || _selectedLimitDuration != LimitDurationType.Animation || (_currentAnimator && _currentAnimator.speed > 0.001f && _animationIsPlaying));
+            bool shouldStartAtNextClick = GUILayout.Toggle(_startOnNextClick, _currentDictionary.GetString(TranslationKey.StartRecordingOnNextClick));
+            if (shouldStartAtNextClick != _startOnNextClick && GUI.enabled)
+            {
+                _startOnNextClick = shouldStartAtNextClick;
+            }
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            {
+                string reason;
+                if (_autoGenerateVideo == false || extension.IsCompatibleWithPlugin(plugin, out reason))
+                {
+                    if (_isRecording == false)
+                    {
+                        GUI.backgroundColor = Color.gray;
+                        if (GUILayout.Button("● " + _currentDictionary.GetString(TranslationKey.StartRecording), Styles.ControlButton, GUILayout.Height(50)))
+                            RecordVideo();
+                    }
+                    else
+                    {
+                        GUI.backgroundColor = Color.gray;
+                        if (GUILayout.Button("■ " + _currentDictionary.GetString(TranslationKey.StopRecording), Styles.ControlButton, GUILayout.Height(50)))
+                            StopRecording();
+                    }
+                    GUI.backgroundColor = Color.white;
+                }
+                else
+                {
+                    GUILayout.Label("Video format is incompatible with the current screenshot plugin or its settings. Reason: " + reason, Styles.WarningLabelStyle);
+                }
+            }
+            GUILayout.EndHorizontal();
+
+            GUI.enabled = prevGuiEnabled;
+
+            GUIStyle customLabel = GUI.skin.label;
+            TextAnchor cachedAlignment = customLabel.alignment;
+            customLabel.alignment = TextAnchor.UpperCenter;
+            GUILayout.Label(_currentMessage);
+            customLabel.alignment = cachedAlignment;
+
+            GUILayout.BeginHorizontal();
+            {
+                Rect progressBarBg = GUILayoutUtility.GetRect(_windowRect.width - 20, 10);
+                Color previousColor = GUI.color;
+                GUI.color = Color.black;
+                GUI.Box(progressBarBg, "", Styles.ProgressBar);
+                Rect progressBarFill = new Rect(progressBarBg.x, progressBarBg.y, progressBarBg.width * Mathf.Clamp(_progressBarPercentage, 0f, 1f), progressBarBg.height);
+                GUI.color = Styles.NormalColorOn;
+                GUI.Box(progressBarFill, "", Styles.ProgressBar);
+                GUI.color = previousColor;
+            }
+            GUILayout.EndHorizontal();
+        }
+
+        private void Window(int id)
+        {
+            Styles.BeginVESkin();
+
+            GUILayout.BeginVertical();
+            if (_screenshotPlugins.Count == 0)
+            {
+                GUILayout.Label("No screenshot plugins available. Update BepisPlugins and check log for related errors.");
+            }
+            else
+            {
+                if (_selectedPlugin < 0 || _selectedPlugin >= _screenshotPlugins.Count)
+                    _selectedPlugin = 0;
+
+                GUILayout.Space(10);
+                WindowCaptureSection();
+                GUILayout.Space(Styles.SectionSpacing);
+                WindowVideoSection();
+                GUILayout.Space(Styles.SectionSpacing);
+                if (_autoGenerateVideo)
+                {
+                    WindowAudioSection();
+                    GUILayout.Space(Styles.SectionSpacing);
+                }
+                WindowOtherSection();
+                GUILayout.Space(Styles.SectionSpacing);
+                WindowRecordSection();
+            }
+            GUILayout.EndVertical();
+
+            ShowTooltip();
+
+            Styles.EndVESkin();
+
+            GUI.DragWindow();
+        }
+
+        void ShowTooltip()
+        {
+            if (_showTooltips && Event.current.type == EventType.Repaint && !string.IsNullOrEmpty(GUI.tooltip))
+            {
+                Vector2 mousePos = Event.current.mousePosition;
+                Vector2 size = GUI.skin.label.CalcSize(new GUIContent(GUI.tooltip));
+                Rect tooltipRect = new Rect(mousePos.x, mousePos.y + 18, size.x + 12, size.y + 12);
+
+                tooltipRect.x = Mathf.Clamp(tooltipRect.x, 0, _windowRect.width - tooltipRect.width);
+
+                GUI.Box(tooltipRect, GUI.tooltip, Styles.TooltipStyle);
+            }
+        }
+
+        private void SetLanguage(Language language)
+        {
+            _language.Value = language;
+            switch (language)
+            {
+                case Language.English:
+                    _currentDictionary = _englishDictionary;
+                    break;
+                case Language.中文:
+                    _currentDictionary = _chineseDictionary;
+                    break;
+            }
+
+            _limitDurationNames = new[]
+            {
+                _currentDictionary.GetString(TranslationKey.LimitByFrames),
+                _currentDictionary.GetString(TranslationKey.LimitBySeconds),
+                _currentDictionary.GetString(TranslationKey.LimitByAnimation),
+                _currentDictionary.GetString(TranslationKey.LimitByTimeline)
+            };
+
+            _updateDynamicBonesTypeNames = new[]
+            {
+                _currentDictionary.GetString(TranslationKey.DBDefault),
+                _currentDictionary.GetString(TranslationKey.DBEveryFrame)
+            };
+
+            foreach (IScreenshotPlugin plugin in _screenshotPlugins)
+                plugin.UpdateLanguage();
+            foreach (IVideoExtension extension in _extensions)
+                extension.UpdateLanguage();
+        }
+
+        private IEnumerator RecordVideo_Routine_Safe()
+        {
+            var coroutine = RecordVideo_Routine();
+            while (true)
+            {
+                try
+                {
+                    if (!coroutine.MoveNext())
+                        break;
+                }
+                catch
+                {
+                    // Make sure the UI gets unlocked if there's an unexpected crash
+                    _isRecording = false;
+                    throw;
+                }
+
+                yield return coroutine.Current;
+            }
+        }
+        private IEnumerator RecordVideo_Routine()
+        {
+            _isRecording = true;
+            _messageColor = Color.white;
+
+            Animator currentAnimator = _currentAnimator;
+
+            IScreenshotPlugin screenshotPlugin = _screenshotPlugins[_selectedPlugin];
+
+            _tempDateTime = DateTime.Now.ToString("yyyy-MM-ddTHH-mm-ss");
+            string framesFolder = Path.Combine(_globalFramesFolder.Value, _tempDateTime);
+
+            if (Directory.Exists(framesFolder) == false)
+                Directory.CreateDirectory(framesFolder);
+
+            int cachedCaptureFramerate = Time.captureFramerate;
+            int cachedApplicationTargetFrameRate = Application.targetFrameRate;
+            int cachedQualitySettingsVSyncCount = QualitySettings.vSyncCount;
+#if (!KOIKATSU || SUNSHINE)
+            int applicationTargetFrameRateStablizer = 0;
+#endif
+            Time.captureFramerate = _fps;
+            Application.targetFrameRate = _fps;
+            QualitySettings.vSyncCount = 0;
+
+            if (_selectedUpdateDynamicBones == UpdateDynamicBonesType.EveryFrame)
+            {
+                foreach (DynamicBone dynamicBone in Resources.FindObjectsOfTypeAll<DynamicBone>())
+                    dynamicBone.m_UpdateRate = -1;
+                foreach (DynamicBone_Ver02 dynamicBone in Resources.FindObjectsOfTypeAll<DynamicBone_Ver02>())
+                    dynamicBone.UpdateRate = -1;
+            }
+
+            _currentRecordingFrame = 0;
+            _currentRecordingTime = 0;
+            screenshotPlugin.OnStartRecording();
+
+            if (_limitDuration)
+            {
+                if (_prewarmLoopCount > 0)
+                {
+                    switch (_selectedLimitDuration)
+                    {
+                        case LimitDurationType.Animation:
+                            int j = 0;
+                            float lastNormalizedTime = 0;
+                            while (true)
+                            {
+                                AnimatorStateInfo info = currentAnimator.GetCurrentAnimatorStateInfo(0);
+                                float currentNormalizedTime = info.normalizedTime % 1f;
+                                if (lastNormalizedTime > 0.5f && currentNormalizedTime < lastNormalizedTime)
+                                    j++;
+                                lastNormalizedTime = currentNormalizedTime;
+                                if (j == _prewarmLoopCount)
+                                {
+                                    if (!info.loop)
+                                        yield return new WaitForEndOfFrame();
+                                    break;
+                                }
+                                yield return new WaitForEndOfFrame();
+                                _currentMessage = $"{_currentDictionary.GetString(TranslationKey.PrewarmingAnimation)} {j + 1}/{_prewarmLoopCount}";
+                                _progressBarPercentage = lastNormalizedTime;
+                            }
+                            break;
+                        case LimitDurationType.Timeline:
+                            if (TimelineCompatibility.GetIsPlaying() == false)
+                                TimelineCompatibility.Play();
+                            j = 0;
+                            float lastTime = 0;
+                            while (true)
+                            {
+                                float duration = TimelineCompatibility.GetDuration();
+                                float currentTime = TimelineCompatibility.GetPlaybackTime() % duration;
+                                if (currentTime < lastTime)
+                                    j++;
+                                lastTime = currentTime;
+                                if (j == _prewarmLoopCount)
+                                    break;
+                                yield return new WaitForEndOfFrame();
+                                _currentMessage = $"{_currentDictionary.GetString(TranslationKey.PrewarmingAnimation)} {j + 1}/{_prewarmLoopCount}";
+                                _progressBarPercentage = lastTime / duration;
+                            }
+                            break;
+                    }
+                }
+            }
+            else
+            {
+                yield return new WaitForEndOfFrame();
+            }
+
+            DateTime startTime = DateTime.Now;
+            _progressBarPercentage = 0f;
+
+            int limit = 1;
+            if (_limitDuration)
+            {
+                switch (_selectedLimitDuration)
+                {
+                    case LimitDurationType.Frames:
+                        limit = Mathf.RoundToInt(_limitDurationNumber);
+                        break;
+                    case LimitDurationType.Seconds:
+                        limit = Mathf.RoundToInt(_limitDurationNumber * _fps);
+                        break;
+                    case LimitDurationType.Animation:
+                        limit = Mathf.RoundToInt(currentAnimator.GetCurrentAnimatorStateInfo(0).length * _limitDurationNumber * _fps);
+                        break;
+                    case LimitDurationType.Timeline:
+                        limit = Mathf.RoundToInt(TimelineCompatibility.EstimateRealDuration() * _limitDurationNumber * _fps);
+                        break;
+                }
+                _recordingFrameLimit = limit;
+            }
+            else
+            {
+                _recordingFrameLimit = -1;
+            }
+
+            if (_selectedLimitDuration == LimitDurationType.Timeline)
+            {
+                if (_realignTimeline)
+                {
+                    TimelineCompatibility.Stop();
+                    TimelineCompatibility.Play();
+                    yield return new WaitForEndOfFrame();
+                    TimelineCompatibility.Stop();
+
+                    // Wait for dynamic bones and other physics to settle
+                    for (int x = 0; x < _fps; x++)
+                        yield return new WaitForEndOfFrame();
+                }
+
+                if (TimelineCompatibility.GetIsPlaying() == false)
+                    TimelineCompatibility.Play();
+            }
+
+            ParallelScreenshotEncoder parallelEncoder = null;
+            if (_parallelScreenshotEncoding)
+                parallelEncoder = new ParallelScreenshotEncoder();
+
+            int exportInterval = _fps / _exportFps;
+            TimeSpan elapsed = TimeSpan.Zero;
+            int i = 0;
+            string imageExtension = screenshotPlugin.extension;
+
+            if (screenshotPlugin is ReshadePlugin rePlugin)
+            {
+                // For the ReshadePlugin, we cannot capture the current frame because Reshade runs after the end of frame.
+                // The Reshade addon stores the frame after reshade finishes effects. That buffer will be one frame behind us.
+                // Because of that, we skip a frame at the start.
+                yield return new WaitForEndOfFrame();
+
+                if (_limitDuration && _selectedLimitDuration != LimitDurationType.Timeline)
+                {
+                    // For branches which did not wait for end of frame before this, the above call only puts them at the end of the current frame.
+                    // We have to do another wait to get to the next frame.
+                    yield return new WaitForEndOfFrame();
+                }
+
+                rePlugin.vFlip = !_autoGenerateVideo;
+            }
+
+            IScreenshotPlugin plugin = _screenshotPlugins[(int)_selectedPlugin];
+            Vector2 currentSize = plugin.currentSize;
+            string targetSize = currentSize.x + "x" + currentSize.y;
+
+            var audioFeed = new AudioFeedResult();
+            int totalFrames = 0;
+            bool error = false;
+            if (_autoGenerateVideo)
+            {
+                _generatingVideo = false;
+
+                if (!Directory.Exists(_outputFolder.Value))
+                {
+                    Directory.CreateDirectory(_outputFolder.Value);
+                }
+
+                float audioLength = (limit / (float)exportInterval) / _fps;
+                audioFeed = BuildAudioFeed(audioLength);
+
+                _messageColor = Color.yellow;
+                _currentMessage = _currentDictionary.GetString(TranslationKey.GeneratingVideo);
+                // Need to match the timing of the first frame, excluding the timeline.
+                if (_selectedLimitDuration != LimitDurationType.Timeline)
+                    yield return null;
+
+                IVideoExtension extension = _extensions[(int)_selectedExtension];
+
+                string fileName = SimplifyPath(Path.Combine(_outputFolder.Value, _tempDateTime));
+                if (screenshotPlugin is ScreencapPlugin && screenshotPlugin.IsRenderTextureCaptureAvailable() == true)
+                {
+                    extension.channelType = 1;
+                }
+                else if (screenshotPlugin is ScreencapPlugin && screenshotPlugin.IsTextureCaptureAvailable() == true)
+                {
+                    extension.channelType = 0;
+                }
+                else
+                {
+                    extension.channelType = 1;
+                }
+
+                extension.SetVFlipNeeded(screenshotPlugin.IsVFlipNeeded());
+
+                extension.GetArguments("-", imageExtension, screenshotPlugin.bitDepth, _exportFps, screenshotPlugin.transparency, _resize, _resizeX, _resizeY, fileName,
+                    out string vInputArgs, out string vFilterArgs, out string vMapArgs, out string vCodecArgs, out string vOutputArgs);
+
+                if (vFilterArgs == null || vFilterArgs == "")
+                    vMapArgs = "-map 0:v";
+                if (vFilterArgs == null || Regex.IsMatch(vFilterArgs, @"^\[[\w:]+\]\W*\[[\w]+\]$"))
+                {
+                    vFilterArgs = "";
+                    vMapArgs = (audioFeed.MapArgs != "") ? "-map 0:v" : "";
+                }
+
+                string arguments = $"-s {targetSize} " +
+                    $"{vInputArgs} {audioFeed.InputArgs} " +
+                    ((vFilterArgs != "" || audioFeed.FilterArgs != "")
+                        ? $"-filter_complex \"{vFilterArgs}{(audioFeed.FilterArgs == "" ? "" : "; ")}{audioFeed.FilterArgs}\" "
+                        : "") +
+                    $"{vMapArgs} {audioFeed.MapArgs} " +
+                    $"{vCodecArgs} {audioFeed.CodecArgs} " +
+                    vOutputArgs;
+                arguments = arguments.Replace("\";", "\"").Replace("\",", "\"").Replace("  ", " ");
+
+                totalFrames = _recordingFrameLimit * _exportFps / _fps;
+
+                if (error == false)
+                {
+                    _ffmpegProcessMaster = StartExternalProcess(extension.GetExecutable(), arguments, false, extension.canProcessStandardError, true);
+
+                    StartCoroutine(HandleProcessOutput(_ffmpegProcessMaster, totalFrames, false, val => error = val, true));
+
+                    InitializeRecoder((int)currentSize.x, (int)currentSize.y);
+
+#if (!KOIKATSU || SUNSHINE)
+                    if (screenshotPlugin is ScreencapPlugin &&
+                        screenshotPlugin.IsRenderTextureCaptureAvailable() == true && _autoGenerateVideo)
+                    {
+                        _simpleBytePool = new SimpleBytePool(_frameBufferSize, _simpleBytePoolSize);
+                        _ffmpegInputComplete = false;
+                        _ffmpegMasterThread = new Thread(FFmpegMasterWriteLoop);
+                        _ffmpegMasterThread.Priority = System.Threading.ThreadPriority.AboveNormal;
+                        _ffmpegMasterThread.Start();
+                    }
+#endif
+                }
+
+                // The related variable name is palettegen, but its function is closer to all of processing of gif.
+                if (_selectedExtension == ExtensionsType.GIF && (extension as GIFExtension)?.IsPaletteGenRequired() == true)
+                {
+                    string arguments_palettegen = (extension as GIFExtension).GetArgumentsPaletteGen(SimplifyPath(framesFolder), "", "", imageExtension, screenshotPlugin.bitDepth, _exportFps, screenshotPlugin.transparency, _resize, _resizeX, _resizeY, (int)currentSize.x, (int)currentSize.y, fileName);
+
+                    _ffmpegProcessSlave = StartExternalProcess(extension.GetExecutable(), arguments_palettegen, false, extension.canProcessStandardError, false);
+
+                    StartCoroutine(HandleProcessOutput(_ffmpegProcessSlave, totalFrames, false, val => error = val, false));
+                }
+            }
+            else
+            {
+                _messageColor = Color.green;
+                _currentMessage = _currentDictionary.GetString(TranslationKey.Done);
+            }
+
+            Logger.LogInfo(
+                BuildAlignedLogBlock("Starting frame capture:",
+                    new[]
+                    {
+                        "Total frames",
+                        "Export frames",
+                        "FPS",
+                        "Export FPS",
+                        "Render resolution",
+                        "Export resolution",
+                        "Generate video"
+                    },
+                    new[]
+                    {
+                        _limitDuration ? limit.ToString() : "Until stopped",
+                        _limitDuration ? (limit / exportInterval).ToString() : "Until stopped",
+                        _fps.ToString(),
+                        _exportFps.ToString(),
+                        targetSize,
+                        _resize ? $"{_resizeX}x{_resizeY}" : targetSize,
+                        _autoGenerateVideo ? "Yes" : "No"
+                    }
+                )
+            );
+
+            int generatedFrames = 0;
+            for (; ; i++)
+            {
+                if (_limitDuration && i >= limit)
+                    StopRecording();
+                if (_breakRecording)
+                {
+                    _breakRecording = false;
+                    break;
+                }
+
+#if (!KOIKATSU || SUNSHINE)
+                if (_ffmpegMasterFrameQueue.Count > 5)
+                {
+                    if (Application.targetFrameRate > 1)
+                    {
+                        Application.targetFrameRate--;
+                    }
+                }
+                else
+                {
+                    if (applicationTargetFrameRateStablizer > Application.targetFrameRate)
+                    {
+                        Application.targetFrameRate++;
+                        applicationTargetFrameRateStablizer = 0;
+                    }
+                    else
+                    {
+                        applicationTargetFrameRateStablizer++;
+                    }
+                }
+#endif
+
+                if (i % exportInterval == 0)
+                {
+                    string savePath = Path.Combine(framesFolder, $"{i / exportInterval}.{imageExtension}");
+
+#if !HONEYSELECT
+                    if (screenshotPlugin is ScreencapPlugin && screenshotPlugin.IsRenderTextureCaptureAvailable() == true)
+                    {
+                        if (_autoGenerateVideo)
+                        {
+                            RenderTexture rt = screenshotPlugin.CaptureRenderTexture();
+                            if (rt)
+                            {
+#if (!KOIKATSU || SUNSHINE)
+                                _asyncGPURequestCount++;
+                                var req = AsyncGPUReadback.Request(rt, 0, (request) => OnCompleteReadback(request, rt));
+#endif
+                            }
+                            else
+                            {
+                                Logger.LogWarning($"Frame capture for frame {i} didn't return a texture. Frame skipped.");
+                            }
+                        }
+                        else
+                        {
+                            Texture2D texture = screenshotPlugin.CaptureTexture();
+                            if (texture)
+                            {
+                                TextureEncoder.EncodeAndWriteTexture(texture, screenshotPlugin.imageFormat, screenshotPlugin.transparency, savePath);
+                                Destroy(texture);
+                                texture = null;
+                                generatedFrames++;
+                            }
+                            else
+                            {
+                                Logger.LogWarning($"Frame capture for frame {i} didn't return a texture. Frame skipped.");
+                            }
+                        }
+                    }
+#if !KOIKATSU
+                    else if (screenshotPlugin is Win32Plugin)
+                    {
+                        if (_autoGenerateVideo)
+                        {
+                            Texture2D texture = screenshotPlugin.CaptureTexture();
+                            if (texture)
+                            {
+                                _frameDataBuffer = GetNativeRawData(texture, _frameDataBuffer);
+                                _ffmpegStdin.BaseStream.Write(_frameDataBuffer, 0, _frameBufferSize);
+                                _ffmpegStdin.BaseStream.Flush();
+                                
+                                Destroy(texture);
+                                texture = null;
+                                generatedFrames++;
+                            }
+                        }
+                        else
+                        {
+                            byte[] frame = screenshotPlugin.Capture(savePath);
+                            if (frame != null)
+                            {
+                                File.WriteAllBytes(savePath, frame);
+                            }
+                            generatedFrames++;
+                        }
+                    }
+#endif
+                    else if (screenshotPlugin.IsTextureCaptureAvailable() == true)
+                    {
+                        Texture2D texture = screenshotPlugin.CaptureTexture();
+                        if (texture)
+                        {
+                            if (_parallelScreenshotEncoding)
+                            {
+                                // WARNING: Textures are scheduled for destruction by the encoder threads.
+                                parallelEncoder.QueueScreenshotDestructive(texture, screenshotPlugin.imageFormat, savePath);
+                            }
+                            else
+                            {
+                                if (_autoGenerateVideo)
+                                {
+                                    _frameDataBuffer = GetNativeRawData(texture, _frameDataBuffer);
+                                    _ffmpegStdin.BaseStream.Write(_frameDataBuffer, 0, _frameBufferSize);
+                                    _ffmpegStdin.BaseStream.Flush();
+                                }
+                                else
+                                {
+                                    TextureEncoder.EncodeAndWriteTexture(texture, screenshotPlugin.imageFormat, screenshotPlugin.transparency, savePath);
+                                }
+
+                                Destroy(texture);
+                                texture = null;
+                            }
+                            generatedFrames++;
+                        }
+                    }
+                    else
+                    {
+                        if (screenshotPlugin is ScreencapPlugin screencapPlugin && screencapPlugin.CaptureToFile(savePath))
+                        {
+                            generatedFrames++;
+                        }
+                        else
+                        {
+                            byte[] frame = screenshotPlugin.Capture(savePath);
+                            if (frame != null)
+                            {
+                                File.WriteAllBytes(savePath, frame);
+                                generatedFrames++;
+                            }
+                        }
+                    }
+#else
+                    byte[] frame = screenshotPlugin.Capture(savePath);
+                    if (frame != null) {
+                        File.WriteAllBytes(savePath, frame);
+                        generatedFrames++;
+                    }
+#endif
+                }
+
+                elapsed = DateTime.Now - startTime;
+
+                _elapsedRenderTime = elapsed;
+
+                TimeSpan remaining = TimeSpan.FromSeconds((limit - i - 1) * elapsed.TotalSeconds / (i + 1));
+
+                if (_limitDuration)
+                    _progressBarPercentage = (i + 1f) / limit;
+                else
+                    _progressBarPercentage = (i % _fps) / (float)_fps;
+
+                _currentMessage = $"{_currentDictionary.GetString(TranslationKey.TakingScreenshot)} {i + 1}{(_limitDuration ? $"/{limit} {_progressBarPercentage * 100:0.0}%\n{_currentDictionary.GetString(TranslationKey.ETA)}: {remaining.Hours:0}:{remaining.Minutes:00}:{remaining.Seconds:00} {_currentDictionary.GetString(TranslationKey.Elapsed)}: {elapsed.Hours:0}:{elapsed.Minutes:00}:{elapsed.Seconds:00}" : "")}";
+
+                _currentRecordingFrame = i + 1;
+                _currentRecordingTime = (i + 1) / (double)_fps;
+                yield return new WaitForEndOfFrame();
+            }
+
+            if (_parallelScreenshotEncoding)
+            {
+                bool success = parallelEncoder.WaitForAll();
+                if (!success)
+                    Logger.LogWarning("Parallel encoder could not finish in a reasonable time.");
+            }
+
+            screenshotPlugin.OnEndRecording();
+            Time.captureFramerate = cachedCaptureFramerate;
+            Application.targetFrameRate = cachedApplicationTargetFrameRate;
+            QualitySettings.vSyncCount = cachedQualitySettingsVSyncCount;
+
+            foreach (DynamicBone dynamicBone in Resources.FindObjectsOfTypeAll<DynamicBone>())
+                dynamicBone.m_UpdateRate = 60;
+            foreach (DynamicBone_Ver02 dynamicBone in Resources.FindObjectsOfTypeAll<DynamicBone_Ver02>())
+                dynamicBone.UpdateRate = 60;
+
+            if (_autoGenerateVideo && !(screenshotPlugin is ScreencapPlugin && screenshotPlugin.IsRenderTextureCaptureAvailable() == true))
+            {
+                _ffmpegStdin.Close();
+                _frameDataBuffer = null;
+                _generatingVideo = false;
+            }
+
+            if (
+                !_autoGenerateVideo ||
+                !(
+                    screenshotPlugin is ScreencapPlugin &&
+                    screenshotPlugin.IsRenderTextureCaptureAvailable() == true &&
+                    _autoGenerateVideo
+                )
+            )
+            {
+                _elapsedRenderTime = TimeSpan.Zero;
+
+                Logger.LogInfo(
+                    BuildAlignedLogBlock("Completed frame capture:",
+                        new[]
+                        {
+                            "Elapsed time",
+                            "Frame count",
+                            "Generated frame count",
+                            "Missing frames",
+                            "Generated video"
+                        },
+                        new[]
+                        {
+                            $"{elapsed.Hours:0}:{elapsed.Minutes:00}:{elapsed.Seconds:00}",
+                            _limitDuration ? _recordingFrameLimit.ToString() : generatedFrames.ToString(),
+                            generatedFrames.ToString(),
+                            _limitDuration ? (limit / exportInterval - generatedFrames).ToString() : "0",
+                            _autoGenerateVideo ? "Yes" : "No"
+                        }
+                    )
+                );
+            }
+
+            _progressBarPercentage = 1;
+
+            if (_autoGenerateVideo)
+            {
+#if (!KOIKATSU || SUNSHINE)
+                // Tell the async writer no more frames are coming so it closes ffmpeg's stdin (else WaitForFFmpegExit deadlocks).
+                _ffmpegInputComplete = true;
+#endif
+                yield return StartCoroutine(WaitForFFmpegExit());
+
+                foreach (var kvp in audioFeed.TmpFiles)
+                {
+                    try
+                    {
+                        File.Delete(kvp.Value);
+                    }
+                    catch (Exception e)
+                    {
+                        Logger.LogWarning("Failed to auto delete temporary files: " + e);
+                    }
+                }
+
+                try
+                {
+                    Directory.Delete(framesFolder, false);
+                }
+                catch (Exception e)
+                {
+                    Logger.LogWarning("Failed to auto delete images: " + e);
+                }
+            }
+
+            _isRecording = false;
+            Resources.UnloadUnusedAssets();
+            GC.Collect();
+
+            if (_closeWhenDone)
+#if HONEYSELECT2 || SUNSHINE
+                Illusion.Game.Utils.Scene.GameEnd(false);
+#else
+                Manager.Scene.Instance.GameEnd(false);
+#endif
+        }
+
+        private Process StartExternalProcess(string exe, string arguments, bool redirectStandardOutput, bool redirectStandardError, bool redirectStandardInput)
+        {
+            IVideoExtension extension = _extensions[(int)_selectedExtension];
+
+            Logger.LogInfo($"Starting process: {exe} {arguments}");
+            Process proc = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = exe,
+                    Arguments = arguments,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WorkingDirectory = Directory.GetCurrentDirectory() + "\\",
+                    RedirectStandardOutput = redirectStandardOutput,
+                    RedirectStandardError = redirectStandardError,
+                    RedirectStandardInput = redirectStandardInput
+                }
+            };
+
+            if (redirectStandardOutput)
+            {
+                proc.OutputDataReceived += (sender, e) =>
+                {
+                    if (!string.IsNullOrEmpty(e.Data))
+                    {
+                        foreach (char c in e.Data)
+                            extension.ProcessStandardOutput(c);
+                        extension.ProcessStandardOutput('\n');
+                    }
+                };
+            }
+
+            return proc;
+        }
+
+        private IEnumerator HandleProcessOutput(Process proc, int totalFrames, bool hasProgressOutput, Action<bool> setError, bool isMaster)
+        {
+            if (!isMaster)
+            {
+                yield return StartCoroutine(WaitForFFmpegExit());
+            }
+
+            bool started = false;
+            try
+            {
+                proc.Start();
+                started = true;
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"Failed to launch '{proc.StartInfo.FileName}'. Make sure the executable exists and isn't blocked by antivirus.\n{e}");
+            }
+            if (!started)
+            {
+                _messageColor = Color.red;
+                _currentMessage = _currentDictionary.GetString(TranslationKey.GeneratingError);
+                setError(true);
+                _breakRecording = true;
+                proc.Close();
+                yield break;
+            }
+
+            if (proc.StartInfo.RedirectStandardInput)
+            {
+                _ffmpegStdin = new BinaryWriter(proc.StandardInput.BaseStream);
+            }
+
+            if (proc.StartInfo.RedirectStandardOutput)
+            {
+                //proc.BeginOutputReadLine();
+            }
+
+            IVideoExtension extension = _extensions[(int)_selectedExtension];
+            extension.ResetProgress();
+
+            DateTime startTime = DateTime.Now;
+            TimeSpan elapsed = TimeSpan.Zero;
+
+            while (proc.HasExited == false)
+            {
+                elapsed = DateTime.Now - startTime;
+                yield return null;
+                proc.Refresh();
+            }
+
+            proc.WaitForExit();
+
+            string errorOut = null;
+            if (proc.StartInfo.RedirectStandardError)
+                errorOut = proc.StandardError.ReadToEnd()?.Trim();
+
+            yield return null;
+
+            int exitCode = proc.ExitCode;
+            if (exitCode == 0)
+            {
+                if (!string.IsNullOrEmpty(errorOut))
+                    Logger.LogInfo(errorOut);
+
+                _messageColor = Color.green;
+                _currentMessage = _currentDictionary.GetString(TranslationKey.Done) +
+                  $"\nTime spent:{elapsed.Hours:0}:{elapsed.Minutes:00}:{elapsed.Seconds:00}";
+            }
+            else
+            {
+                string stage = isMaster ? "main encode pass" : "secondary pass (GIF palette)";
+                Logger.LogError(
+                    $"ffmpeg failed during the {stage} (exit code {exitCode}); the output file was not produced.\n" +
+                    $"Command: {proc.StartInfo.FileName} {proc.StartInfo.Arguments}\n" +
+                    $"ffmpeg output:\n{(string.IsNullOrEmpty(errorOut) ? "(no error output captured)" : errorOut)}");
+
+                _messageColor = Color.red;
+                _currentMessage = _currentDictionary.GetString(TranslationKey.GeneratingError);
+                setError(true);
+            }
+            proc.Close();
+
+            if (!isMaster)
+            {
+                string fileName = SimplifyPath(Path.Combine(_outputFolder.Value, _tempDateTime));
+                string palettePath = $"{fileName}.mov";
+                if (File.Exists(palettePath))
+                    File.Delete(palettePath);
+            }
+        }
+
+        private string SimplifyPath(string path)
+        {
+            string currentDirectory = Directory.GetCurrentDirectory().ToLowerInvariant().Replace('/', '\\');
+            if (path.ToLowerInvariant().Replace('/', '\\').StartsWith(currentDirectory))
+            {
+                path = path.Remove(0, currentDirectory.Length);
+                if (path.StartsWith("/") || path.StartsWith("\\"))
+                    path = path.Remove(0, 1);
+            }
+            return path;
+        }
+        #endregion
+
+        private bool IsFFmpegProcessRunning()
+        {
+            if (_ffmpegProcessMaster == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                return !_ffmpegProcessMaster.HasExited;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public IEnumerator WaitForFFmpegExit()
+        {
+            while (IsFFmpegProcessRunning())
+            {
+                yield return null;
+            }
+        }
+
+        private void InitializeRecoder(int width, int height)
+        {
+            int bytesPerPixel = 4; // aspects of ARGB
+
+            _frameBufferSize = width * height * bytesPerPixel;
+
+            if (_frameDataBuffer == null || _frameDataBuffer.Length != _frameBufferSize)
+            {
+                _frameDataBuffer = new byte[_frameBufferSize];
+            }
+        }
+
+        private static string BuildAlignedLogBlock(string headerTitle, string[] titles, string[] values)
+        {
+            if (titles == null) throw new ArgumentNullException(nameof(titles));
+            if (values == null) throw new ArgumentNullException(nameof(values));
+            if (titles.Length != values.Length)
+                throw new ArgumentException("titles and values must have same length.");
+
+            int cols = titles.Length;
+            int[] widths = new int[cols];
+
+            for (int i = 0; i < cols; i++)
+                widths[i] = Math.Max(titles[i]?.Length ?? 0, values[i]?.Length ?? 0);
+
+            var headerText = new System.Text.StringBuilder();
+            var valuesText = new System.Text.StringBuilder();
+
+            for (int i = 0; i < cols; i++)
+            {
+                if (i > 0)
+                {
+                    headerText.Append(" | ");
+                    valuesText.Append(" | ");
+                }
+
+                string titleString = titles[i] ?? string.Empty;
+                string valueString = values[i] ?? string.Empty;
+
+                headerText.Append(titleString.PadRight(widths[i]));
+                valuesText.Append(valueString.PadRight(widths[i]));
+            }
+
+            return $"{headerTitle}\n{headerText}\n{valuesText}";
+        }
+
+#if (!KOIKATSU || SUNSHINE)
+        public byte[] GetNativeRawData(Texture2D texture, byte[] textureBytes)
+        {
+            NativeArray<byte> nativeData = texture.GetRawTextureData<byte>();
+            nativeData.CopyTo(textureBytes);
+            nativeData.Dispose();
+
+            return textureBytes;
+        }
+
+        private void OnCompleteReadback(AsyncGPUReadbackRequest request, RenderTexture rt)
+        {
+            try
+            {
+                if (request.hasError)
+                {
+                    Logger.LogWarning(
+                        $"AsyncGPUReadback received an error while waiting for frame {_frameCount + 1} " +
+                        "Resulting video will have missing frames."
+                    );
+                    return;
+                }
+
+                NativeArray<byte> pixelData = request.GetData<byte>();
+                byte[] buffer = _simpleBytePool.Rent();
+                pixelData.CopyTo(buffer);
+                _ffmpegMasterFrameQueue.Enqueue(new SimpleFrameData { index = _frameCount++, data = buffer });
+                _ffmpegMasterFrameSignal.Set();
+            }
+            finally
+            {
+                RenderTexture.ReleaseTemporary(rt);
+                _asyncGPUCompleteCount++;
+            }
+        }
+
+        private void StopProcessByAsync()
+        {
+            if (_ffmpegStdin != null)
+            {
+                _ffmpegStdin.Close();
+                _ffmpegStdin = null;
+                _frameDataBuffer = null;
+            }
+            
+            Logger.LogInfo(
+                BuildAlignedLogBlock("Completed frame capture:", 
+                    new []
+                    {
+                        "Elapsed time",
+                        "Frame count",
+                        "Handled frame count",
+                        "Missing frame count",
+                        "Generated video"
+                    }, 
+                    new []
+                    {
+                        $"{_elapsedRenderTime.Hours:0}:{_elapsedRenderTime.Minutes:00}:{_elapsedRenderTime.Seconds:00}",
+                        _limitDuration ? _recordingFrameLimit.ToString() : _asyncGPURequestCount.ToString(),
+                        _asyncGPUCompleteCount.ToString(),
+                        _limitDuration ? (_recordingFrameLimit - _asyncGPUCompleteCount).ToString() : (_asyncGPURequestCount - _asyncGPUCompleteCount).ToString(),
+                        _autoGenerateVideo ? "Yes" : "No"
+                    }
+                )
+            );
+
+            _asyncGPURequestCount = 0;
+            _asyncGPUCompleteCount = 0;
+
+            if (_simpleBytePool != null)
+            {
+                _simpleBytePool.CleanupPool();
+                _simpleBytePool = null;
+            }
+
+            _elapsedRenderTime = TimeSpan.Zero;
+            _frameCount = 0;
+            _nextFrameToProcess = 0;
+            _generatingVideo = false;
+        }
+
+        private void FFmpegMasterWriteLoop()
+        {
+            const int waitTimeoutMs = 100;
+            const int maxExtraWaitMs = 15_000;
+            int waitedAfterStopMs = 0;
+
+            while (true)
+            {
+                _ffmpegMasterFrameSignal.WaitOne(waitTimeoutMs);
+
+                while (_ffmpegMasterFrameQueue.TryDequeue(out SimpleFrameData frame))
+                {
+                    _reorderBuffer.Add(frame.index, frame.data);
+                }
+
+                while (_reorderBuffer.Count > 0 && _reorderBuffer.Keys[0] == _nextFrameToProcess)
+                {
+                    byte[] dataToWrite = _reorderBuffer.Values[0];
+                    _ffmpegStdin.Write(dataToWrite);
+                    _simpleBytePool.Return(dataToWrite);
+                    _reorderBuffer.RemoveAt(0);
+                    _nextFrameToProcess++;
+                }
+
+                bool stopRequested = !_isRecording || _ffmpegInputComplete;
+
+                if (stopRequested
+                    && _ffmpegMasterFrameQueue.IsEmpty
+                    && _asyncGPUCompleteCount >= _asyncGPURequestCount)
+                {
+                    break;
+                }
+
+                // If input is complete, but we still have pending GPU work,
+                // accumulate wait time and eventually bail out with a warning.
+                if (stopRequested
+                    && (_asyncGPUCompleteCount < _asyncGPURequestCount
+                        || !_ffmpegMasterFrameQueue.IsEmpty))
+                {
+                    waitedAfterStopMs += waitTimeoutMs;
+
+                    if (waitedAfterStopMs >= maxExtraWaitMs)
+                    {
+                        Logger.LogWarning(
+                            "FFmpeg input stream: timeout waiting for async GPU readbacks to finish. " +
+                            $"Requests={_asyncGPURequestCount}, Completed={_asyncGPUCompleteCount}, " +
+                            $"NextFrame={_nextFrameToProcess}. Exiting FFmpeg with missing frames."
+                        );
+
+                        break;
+                    }
+                }
+                else
+                {
+                    waitedAfterStopMs = 0;
+                }
+            }
+
+            StopProcessByAsync();
+        }
+#else
+        //https://meetemq.com/2023/01/14/using-pointers-in-c-unity/
+        [MethodImpl(256)] //256 = MethodImplOptions.AggressiveInlining (enum member is missing but it still works)
+        public static unsafe void* GetInternalPointer(object obj)
+        {
+            return *(void**)((ulong)*(IntPtr*)&obj + (ulong)(sizeof(IntPtr) * 2));
+        }
+
+        // Structs and functions inferred from decompilation of CharaStudio.exe at 0x140805fe0
+        [StructLayout(LayoutKind.Sequential)]
+        private unsafe struct TextureAccess
+        {
+            public fixed byte otherData[80];
+            public TextureData* texData;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private unsafe struct TextureData
+        {
+            public fixed byte monoHeader[16];
+            public byte* tex;
+            public fixed byte otherData[40];
+            public ulong size;
+        }
+
+        public static byte[] GetNativeRawData(Texture2D tex, byte[] textureBytes)
+        {
+            //Pointer access can be flaky, try multiple times
+            const int maxAttempts = 10;
+            if (tex == null)
+                return null;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                try
+                {
+                    byte[] result = GetNativeRawDataInternal(tex, textureBytes);
+                    if (result != null)
+                        return result;
+                }
+                catch (Exception e)
+                {
+                    Logger.LogError("Exception in GetNativeRawDataInternal: " + e);
+                }
+            }
+
+            Logger.LogError("GetNativeRawDataInternal failed after " + maxAttempts + " attempts.");
+            return null;
+        }
+
+        private static unsafe byte[] GetNativeRawDataInternal(Texture2D tex, byte[] textureBytes)
+        {
+            var texPtr = (TextureAccess*)GetInternalPointer(tex);
+
+            if (texPtr == null)
+                return null;
+
+            TextureData* data = texPtr->texData;
+            if (data == null)
+            {
+                Logger.LogError("TextureData pointer is null.");
+                return null;
+            }
+
+            byte* nativeBuffer = data->tex;
+            if (nativeBuffer == null)
+            {
+                Logger.LogError("Native texture buffer pointer is null.");
+                return null;
+            }
+
+            ulong nativeSize = data->size;
+            if (nativeSize == 0 || nativeSize > int.MaxValue)
+            {
+                Logger.LogError($"Invalid native texture size: {nativeSize}");
+                return null;
+            }
+
+            if (textureBytes == null || textureBytes.Length != (int)nativeSize)
+            {
+                textureBytes = new byte[nativeSize];
+            }
+            Marshal.Copy(new IntPtr(nativeBuffer), textureBytes, 0, (int)nativeSize);
+            return textureBytes;
+        }
+#endif
+    }
+}

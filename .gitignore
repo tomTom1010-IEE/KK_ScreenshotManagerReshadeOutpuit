@@ -13,6 +13,11 @@
 !/README.md
 !/LICENSE
 !/release.ps1
+!/Native/
+!/Native/OfflineDepthD3D11Bridge/
+Native/OfflineDepthD3D11Bridge/build/
+!/Native/OfflineDepthD3D11Bridge/bridge.cpp
+!/Native/OfflineDepthD3D11Bridge/CMakeLists.txt
 !/src/
 /src/*
 !/src/Core_Screencap/

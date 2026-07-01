@@ -1,3 +1,143 @@
+# KK/KKS ScreenshotManager ReShade Output
+
+This fork publishes the Screencap/ScreenshotManager changes needed to export
+Offline ReShade inputs from Koikatu and Koikatsu Sunshine. It is intentionally
+scoped to the Screencap plugin even though the working tree is based on
+BepisPlugins.
+
+## What This Adds
+
+- `Ctrl+F10` Offline ReShade export in ScreenshotManager.
+- `coloroutput.png`, depth sidecar, and `metadata.json` in
+  `UserData\cap\OfflineReShade`.
+- Optional timestamped archive files in the normal screenshot directory.
+- KKS hardware/device depth export through Unity 2019.4.
+- KK device-depth export through the native D3D11 bridge in
+  `Native\OfflineDepthD3D11Bridge`.
+
+## Install
+
+1. Install BepInEx 5 and the usual BepisPlugins dependencies for your game.
+2. Build this repository, or use the built Screencap DLL from your local build:
+   - KK: `Screencap.dll`
+   - KKS: `KKS_Screencap.dll`
+3. Put the Screencap DLL in the game's `BepInEx\plugins` folder.
+4. For KK only, build `Native\OfflineDepthD3D11Bridge` and put
+   `OfflineDepthD3D11Bridge.dll` next to `Screencap.dll`, or set
+   `Offline ReShade Export > D3D11 bridge DLL path` to its absolute path.
+
+Native bridge build:
+
+```powershell
+cmake -S Native\OfflineDepthD3D11Bridge -B Native\OfflineDepthD3D11Bridge\build -G Ninja
+cmake --build Native\OfflineDepthD3D11Bridge\build --config Release
+```
+
+The native DLL is not required for KKS. KK needs it for high quality
+off-screen device depth; the older Unity replacement-depth fallback is kept as
+diagnostic history, not as the main path.
+
+## Settings
+
+ConfigurationManager section: `Offline ReShade Export`
+
+- `Export color and depth`: default hotkey is `LeftCtrl + F10`.
+- `Export directory`: default is `UserData\cap\OfflineReShade`.
+- `Archive color/depth in screenshot directory`: also writes timestamped
+  `...-Color.png` and `...-Depth.*` files to `UserData\cap`.
+- `Log export timings`: writes detailed timing diagnostics to the game log.
+- KKS `Depth output format`: defaults to `RawRFloat`.
+- KK `D3D11 bridge DLL path`: optional explicit path to the native bridge.
+- KK `D3D11 bridge log path`: native bridge diagnostic log path.
+- KK `D3D11 bridge candidate diagnostics`: slow candidate sampling log for
+  debugging wrong/empty depth frames.
+
+## Output Files
+
+Default realtime handoff directory:
+
+```text
+UserData\cap\OfflineReShade\
+  coloroutput.png
+  depthoutput.rfloat
+  metadata.json
+```
+
+When archive output is enabled, the normal screenshot folder also receives
+timestamped copies:
+
+```text
+UserData\cap\CharaStudio-YYYY-MM-DD-HH-MM-SS-Color.png
+UserData\cap\CharaStudio-YYYY-MM-DD-HH-MM-SS-Depth.rfloat
+```
+
+VideoExport `Normal + Depth` writes one pair per frame:
+
+```text
+UserData\VideoExport\Frames\<timestamp>\
+  0.png
+  0.depth.rfloat
+  1.png
+  1.depth.rfloat
+  metadata.json
+```
+
+## Depth Format
+
+Current main format:
+
+- extension: `.rfloat`
+- encoding: `rfloat32_device_depth_little_endian`
+- element type: little-endian IEEE 754 `float32`
+- dimensions: `metadata.depthWidth * metadata.depthHeight`
+- row order: `bottom_to_top`
+- value: D3D/Unity device depth in `0..1`
+- reversed-Z flag: `metadata.reshadeDepthReversed`
+
+Earlier diagnostic formats may still exist in code paths:
+
+- `.rgba8`: raw packed RGBA8 device depth
+- `.png`: packed RGBA8 PNG device depth
+
+Packed RGBA8 stores:
+
+```text
+v = round(saturate(deviceDepth) * 4294967295)
+R = v & 0xFF
+G = (v >> 8) & 0xFF
+B = (v >> 16) & 0xFF
+A = (v >> 24) & 0xFF
+```
+
+`metadata.json` fields:
+
+- `width`, `height`: color output size
+- `depthWidth`, `depthHeight`: depth sidecar size
+- `nearClip`, `farClip`, `fov`, `aspect`: camera parameters
+- `downscalingRate`: ScreenshotManager supersampling rate
+- `colorResolve`: currently `screenshotmanager_lanczos`
+- `depthEncoding`, `depthFileExtension`, `depthByteOrder`, `depthRows`
+- `depthCaptureSource`: Unity hardware, KK D3D11 bridge, or fallback source
+- `reshadeDepthReversed`, `reshadeDepthUpsideDown`, `reshadeFarPlane`
+
+## Algorithm Notes
+
+KKS uses Unity 2019.4's camera depth texture path. ScreenshotManager renders
+the off-screen camera at the requested supersampled size, copies/reads device
+depth, and exports it as raw float depth.
+
+KK uses Unity 5.6.2, where `BuiltinRenderTextureType.Depth` is not reliable for
+this off-screen render path. The native bridge hooks the Unity D3D11 immediate
+context during the `Camera.Render()` window, records depth-stencil views, checks
+readable non-MSAA candidates for nonzero content, copies the selected depth to
+an `R32_FLOAT` texture, then writes delayed staging readbacks to `.rfloat`.
+Empty candidates are not written; VideoExport can retry the same frame.
+
+This bridge is archived here rather than in a separate repository because it is
+tightly coupled to ScreenshotManager's off-screen export timing and metadata.
+
+---
+
 # BepisPlugins
 A collection of essential [BepInEx](https://github.com/BepInEx/BepInEx) plugins for Koikatu / Koikatsu Party, EmotionCreators, AI-Shoujo / AI-Girl, HoneySelect2, HoneyCome, SamabakeScramble / Summer Vacation Scramble, and other games by Illusion/Illgames. Check plugin descriptions below for a full list of included plugins. 
 

@@ -614,6 +614,8 @@ namespace Screencap
                 try
                 {
                     D3D11DepthBridge.SetUnityD3D11Texture(colorRt);
+                    D3D11DepthBridge.IssueRenderThreadHookEvent();
+                    ForceD3D11DepthBridgeProbeFlush(colorRt, timingLabel, "D3D11 render-thread hook flush");
                     cam.Render();
                     if (!string.IsNullOrEmpty(d3d11DepthRFloatPath))
                         D3D11DepthBridge.IssueDepthRFloatReadbackEvent(d3d11DepthRFloatPath);

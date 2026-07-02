@@ -29,10 +29,16 @@ enum ContextVTableIndex
     kDrawInstanced = 21,
     kOMSetRenderTargets = 33,
     kOMSetRenderTargetsAndUAV = 34,
+    kOMSetDepthStencilState = 36,
     kDrawAuto = 38,
     kDrawIndexedInstancedIndirect = 39,
     kDrawInstancedIndirect = 40,
+    kRSSetViewports = 44,
+    kCopySubresourceRegion = 46,
+    kCopyResource = 47,
+    kClearRenderTargetView = 50,
     kClearDepthStencilView = 53,
+    kResolveSubresource = 57,
 };
 
 struct HookSlot
@@ -81,9 +87,59 @@ struct CandidateContentStats
     double meanNonZero = 0.0;
 };
 
+struct Texture2DInfo
+{
+    uintptr_t view = 0;
+    uintptr_t resource = 0;
+    UINT width = 0;
+    UINT height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    UINT sampleCount = 0;
+    UINT sampleQuality = 0;
+    UINT bindFlags = 0;
+    UINT miscFlags = 0;
+};
+
+struct RenderPassStats
+{
+    UINT serial = 0;
+    Texture2DInfo rtv0;
+    Texture2DInfo dsv;
+    bool hasViewport = false;
+    D3D11_VIEWPORT viewport{};
+    uintptr_t depthState = 0;
+    bool hasDepthState = false;
+    BOOL depthEnable = TRUE;
+    D3D11_DEPTH_WRITE_MASK depthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    D3D11_COMPARISON_FUNC depthFunc = D3D11_COMPARISON_LESS;
+    UINT stencilRef = 0;
+    UINT bindCount = 0;
+    UINT drawCount = 0;
+    UINT clearRtvCount = 0;
+    UINT clearDsvCount = 0;
+    UINT lastDrawSerial = 0;
+    UINT lastClearRtvSerial = 0;
+    UINT lastClearDsvSerial = 0;
+};
+
+struct ResourceTransferStats
+{
+    UINT serial = 0;
+    const wchar_t* op = L"";
+    Texture2DInfo dst;
+    Texture2DInfo src;
+    DXGI_FORMAT resolveFormat = DXGI_FORMAT_UNKNOWN;
+};
+
 using OMSetRenderTargetsFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
 using OMSetRenderTargetsAndUAVFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*, UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*);
+using OMSetDepthStencilStateFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilState*, UINT);
+using RSSetViewportsFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_VIEWPORT*);
+using ClearRenderTargetViewFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT[4]);
 using ClearDepthStencilViewFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
+using CopyResourceFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*);
+using CopySubresourceRegionFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT, const D3D11_BOX*);
+using ResolveSubresourceFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, ID3D11Resource*, UINT, DXGI_FORMAT);
 using DrawIndexedFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 using DrawFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 using DrawIndexedInstancedFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
@@ -103,8 +159,22 @@ int g_captureWidth = 0;
 int g_captureHeight = 0;
 UINT g_bindSerial = 0;
 uintptr_t g_currentDsv = 0;
+uintptr_t g_currentRtv0 = 0;
 std::wstring g_captureLabel;
 std::unordered_map<uintptr_t, DsvStats> g_dsvStats;
+std::vector<RenderPassStats> g_renderPassStats;
+std::vector<ResourceTransferStats> g_resourceTransferStats;
+UINT g_passSerial = 0;
+UINT g_currentPassSerial = 0;
+UINT g_operationSerial = 0;
+D3D11_VIEWPORT g_currentViewport{};
+bool g_hasCurrentViewport = false;
+uintptr_t g_currentDepthState = 0;
+bool g_hasCurrentDepthState = false;
+BOOL g_currentDepthEnable = TRUE;
+D3D11_DEPTH_WRITE_MASK g_currentDepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+D3D11_COMPARISON_FUNC g_currentDepthFunc = D3D11_COMPARISON_LESS;
+UINT g_currentStencilRef = 0;
 UINT g_omSetCalls = 0;
 UINT g_omSetNullDsvCalls = 0;
 UINT g_clearDsvCalls = 0;
@@ -121,7 +191,13 @@ constexpr size_t kMaxPendingDepthReadbacks = 4;
 
 OMSetRenderTargetsFn g_OMSetRenderTargets = nullptr;
 OMSetRenderTargetsAndUAVFn g_OMSetRenderTargetsAndUAV = nullptr;
+OMSetDepthStencilStateFn g_OMSetDepthStencilState = nullptr;
+RSSetViewportsFn g_RSSetViewports = nullptr;
+ClearRenderTargetViewFn g_ClearRenderTargetView = nullptr;
 ClearDepthStencilViewFn g_ClearDepthStencilView = nullptr;
+CopyResourceFn g_CopyResource = nullptr;
+CopySubresourceRegionFn g_CopySubresourceRegion = nullptr;
+ResolveSubresourceFn g_ResolveSubresource = nullptr;
 DrawIndexedFn g_DrawIndexed = nullptr;
 DrawFn g_Draw = nullptr;
 DrawIndexedInstancedFn g_DrawIndexedInstanced = nullptr;
@@ -157,6 +233,62 @@ bool IsCaptureActiveNoLock()
     return g_initialized && g_captureActive;
 }
 
+bool FillTexture2DInfoFromResourceNoLock(ID3D11Resource* resource, Texture2DInfo* info)
+{
+    if (resource == nullptr || info == nullptr)
+        return false;
+
+    ID3D11Texture2D* texture = nullptr;
+    HRESULT hr = resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&texture));
+    if (FAILED(hr) || texture == nullptr)
+        return false;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    texture->GetDesc(&desc);
+    info->resource = reinterpret_cast<uintptr_t>(resource);
+    info->width = desc.Width;
+    info->height = desc.Height;
+    info->format = desc.Format;
+    info->sampleCount = desc.SampleDesc.Count;
+    info->sampleQuality = desc.SampleDesc.Quality;
+    info->bindFlags = desc.BindFlags;
+    info->miscFlags = desc.MiscFlags;
+    texture->Release();
+    return true;
+}
+
+bool FillTexture2DInfoFromRtvNoLock(ID3D11RenderTargetView* rtv, Texture2DInfo* info)
+{
+    if (rtv == nullptr || info == nullptr)
+        return false;
+
+    info->view = reinterpret_cast<uintptr_t>(rtv);
+    ID3D11Resource* resource = nullptr;
+    rtv->GetResource(&resource);
+    if (resource == nullptr)
+        return false;
+
+    const bool ok = FillTexture2DInfoFromResourceNoLock(resource, info);
+    resource->Release();
+    return ok;
+}
+
+bool FillTexture2DInfoFromDsvNoLock(ID3D11DepthStencilView* dsv, Texture2DInfo* info)
+{
+    if (dsv == nullptr || info == nullptr)
+        return false;
+
+    info->view = reinterpret_cast<uintptr_t>(dsv);
+    ID3D11Resource* resource = nullptr;
+    dsv->GetResource(&resource);
+    if (resource == nullptr)
+        return false;
+
+    const bool ok = FillTexture2DInfoFromResourceNoLock(resource, info);
+    resource->Release();
+    return ok;
+}
+
 void ClearDsvStatsNoLock()
 {
     for (auto& kv : g_dsvStats)
@@ -168,6 +300,21 @@ void ClearDsvStatsNoLock()
         }
     }
     g_dsvStats.clear();
+    g_renderPassStats.clear();
+    g_resourceTransferStats.clear();
+    g_currentDsv = 0;
+    g_currentRtv0 = 0;
+    g_currentPassSerial = 0;
+    g_passSerial = 0;
+    g_operationSerial = 0;
+    g_hasCurrentViewport = false;
+    g_currentViewport = D3D11_VIEWPORT{};
+    g_currentDepthState = 0;
+    g_hasCurrentDepthState = false;
+    g_currentDepthEnable = TRUE;
+    g_currentDepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    g_currentDepthFunc = D3D11_COMPARISON_LESS;
+    g_currentStencilRef = 0;
 }
 
 void RecordDsvNoLock(ID3D11DepthStencilView* dsv)
@@ -219,7 +366,21 @@ void RecordDsvNoLock(ID3D11DepthStencilView* dsv)
     resource->Release();
 }
 
-void RecordOmSetNoLock(ID3D11DepthStencilView* dsv)
+RenderPassStats* FindCurrentPassNoLock()
+{
+    if (g_currentPassSerial == 0)
+        return nullptr;
+
+    for (auto& pass : g_renderPassStats)
+    {
+        if (pass.serial == g_currentPassSerial)
+            return &pass;
+    }
+
+    return nullptr;
+}
+
+void RecordOmSetNoLock(UINT numRtvs, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv)
 {
     if (IsCaptureActiveNoLock())
     {
@@ -229,6 +390,35 @@ void RecordOmSetNoLock(ID3D11DepthStencilView* dsv)
     }
 
     RecordDsvNoLock(dsv);
+
+    if (!IsCaptureActiveNoLock())
+        return;
+
+    Texture2DInfo rtvInfo{};
+    if (rtvs != nullptr && numRtvs > 0 && rtvs[0] != nullptr)
+        FillTexture2DInfoFromRtvNoLock(rtvs[0], &rtvInfo);
+
+    Texture2DInfo dsvInfo{};
+    if (dsv != nullptr)
+        FillTexture2DInfoFromDsvNoLock(dsv, &dsvInfo);
+
+    g_currentRtv0 = rtvInfo.view;
+
+    RenderPassStats pass{};
+    pass.serial = ++g_passSerial;
+    pass.rtv0 = rtvInfo;
+    pass.dsv = dsvInfo;
+    pass.hasViewport = g_hasCurrentViewport;
+    pass.viewport = g_currentViewport;
+    pass.depthState = g_currentDepthState;
+    pass.hasDepthState = g_hasCurrentDepthState;
+    pass.depthEnable = g_currentDepthEnable;
+    pass.depthWriteMask = g_currentDepthWriteMask;
+    pass.depthFunc = g_currentDepthFunc;
+    pass.stencilRef = g_currentStencilRef;
+    pass.bindCount = 1;
+    g_currentPassSerial = pass.serial;
+    g_renderPassStats.push_back(pass);
 }
 
 void RecordDrawNoLock()
@@ -243,6 +433,13 @@ void RecordDrawNoLock()
     auto it = g_dsvStats.find(g_currentDsv);
     if (it != g_dsvStats.end())
         it->second.drawCount++;
+
+    auto* pass = FindCurrentPassNoLock();
+    if (pass != nullptr)
+    {
+        pass->drawCount++;
+        pass->lastDrawSerial = ++g_operationSerial;
+    }
 }
 
 void RecordClearNoLock(ID3D11DepthStencilView* dsv)
@@ -255,13 +452,20 @@ void RecordClearNoLock(ID3D11DepthStencilView* dsv)
     auto it = g_dsvStats.find(reinterpret_cast<uintptr_t>(dsv));
     if (it != g_dsvStats.end())
         it->second.clearCount++;
+
+    auto* pass = FindCurrentPassNoLock();
+    if (pass != nullptr && pass->dsv.view == reinterpret_cast<uintptr_t>(dsv))
+    {
+        pass->clearDsvCount++;
+        pass->lastClearDsvSerial = ++g_operationSerial;
+    }
 }
 
 void STDMETHODCALLTYPE Hook_OMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numViews, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv)
 {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        RecordOmSetNoLock(dsv);
+        RecordOmSetNoLock(numViews, rtvs, dsv);
     }
     g_OMSetRenderTargets(ctx, numViews, rtvs, dsv);
 }
@@ -270,9 +474,83 @@ void STDMETHODCALLTYPE Hook_OMSetRenderTargetsAndUAV(ID3D11DeviceContext* ctx, U
 {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        RecordOmSetNoLock(dsv);
+        RecordOmSetNoLock(numRtvs, rtvs, dsv);
     }
     g_OMSetRenderTargetsAndUAV(ctx, numRtvs, rtvs, dsv, uavStartSlot, numUavs, uavs, initialCounts);
+}
+
+void STDMETHODCALLTYPE Hook_OMSetDepthStencilState(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* depthStencilState, UINT stencilRef)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_currentDepthState = reinterpret_cast<uintptr_t>(depthStencilState);
+        g_currentStencilRef = stencilRef;
+        g_hasCurrentDepthState = true;
+
+        if (depthStencilState != nullptr)
+        {
+            D3D11_DEPTH_STENCIL_DESC desc{};
+            depthStencilState->GetDesc(&desc);
+            g_currentDepthEnable = desc.DepthEnable;
+            g_currentDepthWriteMask = desc.DepthWriteMask;
+            g_currentDepthFunc = desc.DepthFunc;
+        }
+        else
+        {
+            g_currentDepthEnable = TRUE;
+            g_currentDepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+            g_currentDepthFunc = D3D11_COMPARISON_LESS;
+        }
+
+        auto* pass = FindCurrentPassNoLock();
+        if (pass != nullptr)
+        {
+            pass->depthState = g_currentDepthState;
+            pass->hasDepthState = true;
+            pass->depthEnable = g_currentDepthEnable;
+            pass->depthWriteMask = g_currentDepthWriteMask;
+            pass->depthFunc = g_currentDepthFunc;
+            pass->stencilRef = g_currentStencilRef;
+        }
+    }
+    g_OMSetDepthStencilState(ctx, depthStencilState, stencilRef);
+}
+
+void STDMETHODCALLTYPE Hook_RSSetViewports(ID3D11DeviceContext* ctx, UINT numViewports, const D3D11_VIEWPORT* viewports)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (numViewports > 0 && viewports != nullptr)
+        {
+            g_currentViewport = viewports[0];
+            g_hasCurrentViewport = true;
+
+            auto* pass = FindCurrentPassNoLock();
+            if (pass != nullptr)
+            {
+                pass->viewport = g_currentViewport;
+                pass->hasViewport = true;
+            }
+        }
+    }
+    g_RSSetViewports(ctx, numViewports, viewports);
+}
+
+void STDMETHODCALLTYPE Hook_ClearRenderTargetView(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const FLOAT colorRGBA[4])
+{
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (IsCaptureActiveNoLock())
+        {
+            auto* pass = FindCurrentPassNoLock();
+            if (pass != nullptr && pass->rtv0.view == reinterpret_cast<uintptr_t>(rtv))
+            {
+                pass->clearRtvCount++;
+                pass->lastClearRtvSerial = ++g_operationSerial;
+            }
+        }
+    }
+    g_ClearRenderTargetView(ctx, rtv, colorRGBA);
 }
 
 void STDMETHODCALLTYPE Hook_ClearDepthStencilView(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, UINT clearFlags, FLOAT depth, UINT8 stencil)
@@ -282,6 +560,44 @@ void STDMETHODCALLTYPE Hook_ClearDepthStencilView(ID3D11DeviceContext* ctx, ID3D
         RecordClearNoLock(dsv);
     }
     g_ClearDepthStencilView(ctx, dsv, clearFlags, depth, stencil);
+}
+
+void RecordTransferNoLock(const wchar_t* op, ID3D11Resource* dst, ID3D11Resource* src, DXGI_FORMAT resolveFormat = DXGI_FORMAT_UNKNOWN)
+{
+    if (!IsCaptureActiveNoLock())
+        return;
+
+    ResourceTransferStats transfer{};
+    transfer.serial = ++g_operationSerial;
+    transfer.op = op;
+    transfer.resolveFormat = resolveFormat;
+    FillTexture2DInfoFromResourceNoLock(dst, &transfer.dst);
+    FillTexture2DInfoFromResourceNoLock(src, &transfer.src);
+
+    if (transfer.dst.resource != 0 || transfer.src.resource != 0)
+    {
+        g_resourceTransferStats.push_back(transfer);
+        if (g_resourceTransferStats.size() > 96)
+            g_resourceTransferStats.erase(g_resourceTransferStats.begin());
+    }
+}
+
+void STDMETHODCALLTYPE Hook_CopyResource(ID3D11DeviceContext* ctx, ID3D11Resource* dstResource, ID3D11Resource* srcResource)
+{
+    { std::lock_guard<std::mutex> lock(g_mutex); RecordTransferNoLock(L"CopyResource", dstResource, srcResource); }
+    g_CopyResource(ctx, dstResource, srcResource);
+}
+
+void STDMETHODCALLTYPE Hook_CopySubresourceRegion(ID3D11DeviceContext* ctx, ID3D11Resource* dstResource, UINT dstSubresource, UINT dstX, UINT dstY, UINT dstZ, ID3D11Resource* srcResource, UINT srcSubresource, const D3D11_BOX* srcBox)
+{
+    { std::lock_guard<std::mutex> lock(g_mutex); RecordTransferNoLock(L"CopySubresourceRegion", dstResource, srcResource); }
+    g_CopySubresourceRegion(ctx, dstResource, dstSubresource, dstX, dstY, dstZ, srcResource, srcSubresource, srcBox);
+}
+
+void STDMETHODCALLTYPE Hook_ResolveSubresource(ID3D11DeviceContext* ctx, ID3D11Resource* dstResource, UINT dstSubresource, ID3D11Resource* srcResource, UINT srcSubresource, DXGI_FORMAT format)
+{
+    { std::lock_guard<std::mutex> lock(g_mutex); RecordTransferNoLock(L"ResolveSubresource", dstResource, srcResource, format); }
+    g_ResolveSubresource(ctx, dstResource, dstSubresource, srcResource, srcSubresource, format);
 }
 
 void STDMETHODCALLTYPE Hook_DrawIndexed(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndexLocation, INT baseVertexLocation)
@@ -376,7 +692,13 @@ bool InstallHooksForContextNoLock(ID3D11DeviceContext* context, const wchar_t* s
 
     INSTALL_CONTEXT_HOOK(kOMSetRenderTargets, Hook_OMSetRenderTargets, OMSetRenderTargetsFn, g_OMSetRenderTargets);
     INSTALL_CONTEXT_HOOK(kOMSetRenderTargetsAndUAV, Hook_OMSetRenderTargetsAndUAV, OMSetRenderTargetsAndUAVFn, g_OMSetRenderTargetsAndUAV);
+    INSTALL_CONTEXT_HOOK(kOMSetDepthStencilState, Hook_OMSetDepthStencilState, OMSetDepthStencilStateFn, g_OMSetDepthStencilState);
+    INSTALL_CONTEXT_HOOK(kRSSetViewports, Hook_RSSetViewports, RSSetViewportsFn, g_RSSetViewports);
+    INSTALL_CONTEXT_HOOK(kCopySubresourceRegion, Hook_CopySubresourceRegion, CopySubresourceRegionFn, g_CopySubresourceRegion);
+    INSTALL_CONTEXT_HOOK(kCopyResource, Hook_CopyResource, CopyResourceFn, g_CopyResource);
+    INSTALL_CONTEXT_HOOK(kClearRenderTargetView, Hook_ClearRenderTargetView, ClearRenderTargetViewFn, g_ClearRenderTargetView);
     INSTALL_CONTEXT_HOOK(kClearDepthStencilView, Hook_ClearDepthStencilView, ClearDepthStencilViewFn, g_ClearDepthStencilView);
+    INSTALL_CONTEXT_HOOK(kResolveSubresource, Hook_ResolveSubresource, ResolveSubresourceFn, g_ResolveSubresource);
     INSTALL_CONTEXT_HOOK(kDrawIndexed, Hook_DrawIndexed, DrawIndexedFn, g_DrawIndexed);
     INSTALL_CONTEXT_HOOK(kDraw, Hook_Draw, DrawFn, g_Draw);
     INSTALL_CONTEXT_HOOK(kDrawIndexedInstanced, Hook_DrawIndexedInstanced, DrawIndexedInstancedFn, g_DrawIndexedInstanced);
@@ -1493,49 +1815,114 @@ void WriteCaptureSummaryNoLock()
     if (g_dsvStats.empty())
     {
         LogLineNoLock(L"  no DSVs observed");
-        return;
     }
-
-    std::vector<DsvStats> stats;
-    stats.reserve(g_dsvStats.size());
-    for (const auto& kv : g_dsvStats)
-        stats.push_back(kv.second);
-
-    std::sort(stats.begin(), stats.end(), [](const DsvStats& a, const DsvStats& b) {
-        return a.lastBindSerial < b.lastBindSerial;
-    });
-
-    int bestScore = -9999;
-    uintptr_t best = 0;
-    for (const auto& s : stats)
+    else
     {
-        const int score = ScoreCandidate(s);
-        if (score > bestScore)
+        std::vector<DsvStats> stats;
+        stats.reserve(g_dsvStats.size());
+        for (const auto& kv : g_dsvStats)
+            stats.push_back(kv.second);
+
+        std::sort(stats.begin(), stats.end(), [](const DsvStats& a, const DsvStats& b) {
+            return a.lastBindSerial < b.lastBindSerial;
+        });
+
+        int bestScore = -9999;
+        uintptr_t best = 0;
+        for (const auto& s : stats)
         {
-            bestScore = score;
-            best = s.dsv;
+            const int score = ScoreCandidate(s);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = s.dsv;
+            }
+
+            std::wstringstream line;
+            line << L"  dsv=0x" << std::hex << s.dsv
+                 << L" resource=0x" << s.resource << std::dec
+                 << L" size=" << s.width << L"x" << s.height
+                 << L" format=" << FormatToString(s.format)
+                 << L" samples=" << s.sampleCount << L":" << s.sampleQuality
+                 << L" bindFlags=0x" << std::hex << s.bindFlags
+                 << L" miscFlags=0x" << s.miscFlags << std::dec
+                 << L" binds=" << s.bindCount
+                 << L" clears=" << s.clearCount
+                 << L" draws=" << s.drawCount
+                 << L" lastBind=" << s.lastBindSerial
+                 << L" score=" << score;
+            LogLineNoLock(line.str());
         }
 
+        std::wstringstream bestLine;
+        bestLine << L"  bestCandidate=0x" << std::hex << best << std::dec << L" score=" << bestScore
+                 << L" requestedSize=" << g_captureWidth << L"x" << g_captureHeight;
+        LogLineNoLock(bestLine.str());
+    }
+
+    std::wstringstream passHeader;
+    passHeader << L"  render passes observed=" << g_renderPassStats.size();
+    LogLineNoLock(passHeader.str());
+
+    for (const auto& pass : g_renderPassStats)
+    {
         std::wstringstream line;
-        line << L"  dsv=0x" << std::hex << s.dsv
-             << L" resource=0x" << s.resource << std::dec
-             << L" size=" << s.width << L"x" << s.height
-             << L" format=" << FormatToString(s.format)
-             << L" samples=" << s.sampleCount << L":" << s.sampleQuality
-             << L" bindFlags=0x" << std::hex << s.bindFlags
-             << L" miscFlags=0x" << s.miscFlags << std::dec
-             << L" binds=" << s.bindCount
-             << L" clears=" << s.clearCount
-             << L" draws=" << s.drawCount
-             << L" lastBind=" << s.lastBindSerial
-             << L" score=" << score;
+        line << L"  pass#" << pass.serial
+             << L" rtv=0x" << std::hex << pass.rtv0.view
+             << L" rtvRes=0x" << pass.rtv0.resource << std::dec
+             << L" rtvSize=" << pass.rtv0.width << L"x" << pass.rtv0.height
+             << L" rtvFmt=" << FormatToString(pass.rtv0.format)
+             << L" rtvSamples=" << pass.rtv0.sampleCount << L":" << pass.rtv0.sampleQuality
+             << L" dsv=0x" << std::hex << pass.dsv.view
+             << L" dsvRes=0x" << pass.dsv.resource << std::dec
+             << L" dsvSize=" << pass.dsv.width << L"x" << pass.dsv.height
+             << L" dsvFmt=" << FormatToString(pass.dsv.format)
+             << L" dsvSamples=" << pass.dsv.sampleCount << L":" << pass.dsv.sampleQuality
+             << L" draws=" << pass.drawCount
+             << L" clearRTV=" << pass.clearRtvCount
+             << L" clearDSV=" << pass.clearDsvCount
+             << L" lastDrawOp=" << pass.lastDrawSerial
+             << L" lastClearRTVOp=" << pass.lastClearRtvSerial
+             << L" lastClearDSVOp=" << pass.lastClearDsvSerial;
+        if (pass.hasViewport)
+        {
+            line << L" viewport=" << pass.viewport.TopLeftX << L"," << pass.viewport.TopLeftY
+                 << L"," << pass.viewport.Width << L"x" << pass.viewport.Height
+                 << L" depthRange=" << pass.viewport.MinDepth << L"-" << pass.viewport.MaxDepth;
+        }
+        else
+        {
+            line << L" viewport=<unset>";
+        }
+        line << L" depthState=0x" << std::hex << pass.depthState << std::dec
+             << L" depthKnown=" << (pass.hasDepthState ? L"true" : L"false")
+             << L" depthEnable=" << pass.depthEnable
+             << L" depthWriteMask=" << static_cast<int>(pass.depthWriteMask)
+             << L" depthFunc=" << static_cast<int>(pass.depthFunc)
+             << L" stencilRef=" << pass.stencilRef;
         LogLineNoLock(line.str());
     }
 
-    std::wstringstream bestLine;
-    bestLine << L"  bestCandidate=0x" << std::hex << best << std::dec << L" score=" << bestScore
-             << L" requestedSize=" << g_captureWidth << L"x" << g_captureHeight;
-    LogLineNoLock(bestLine.str());
+    std::wstringstream transferHeader;
+    transferHeader << L"  resource transfers observed=" << g_resourceTransferStats.size();
+    LogLineNoLock(transferHeader.str());
+    for (const auto& transfer : g_resourceTransferStats)
+    {
+        std::wstringstream line;
+        line << L"  transfer#" << transfer.serial
+             << L" op=" << transfer.op
+             << L" dst=0x" << std::hex << transfer.dst.resource
+             << L" src=0x" << transfer.src.resource << std::dec
+             << L" dstSize=" << transfer.dst.width << L"x" << transfer.dst.height
+             << L" dstFmt=" << FormatToString(transfer.dst.format)
+             << L" dstSamples=" << transfer.dst.sampleCount << L":" << transfer.dst.sampleQuality
+             << L" srcSize=" << transfer.src.width << L"x" << transfer.src.height
+             << L" srcFmt=" << FormatToString(transfer.src.format)
+             << L" srcSamples=" << transfer.src.sampleCount << L":" << transfer.src.sampleQuality;
+        if (transfer.resolveFormat != DXGI_FORMAT_UNKNOWN)
+            line << L" resolveFmt=" << FormatToString(transfer.resolveFormat);
+        LogLineNoLock(line.str());
+    }
 }
 
 void StoreUnityDeviceNoLock(void* device, int deviceType, int eventType)

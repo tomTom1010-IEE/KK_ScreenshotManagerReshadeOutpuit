@@ -1077,22 +1077,33 @@ const DsvStats* SelectBestReadableDepthValidatedNoLock()
     context->Release();
     device->Release();
 
-    const DsvStats* selected = bestExactNonZero != nullptr ? bestExactNonZero : bestAnyNonZero;
-    if (selected != nullptr)
+    if (bestExactNonZero != nullptr)
     {
-        const auto& selectedStats = bestExactNonZero != nullptr ? bestExactStats : bestAnyStats;
         std::wstringstream ss;
-        ss << L"D3D11 depth candidate validation selected dsv=0x" << std::hex << selected->dsv << std::dec
-           << L" nonZero=" << selectedStats.nonZero
-           << L" exactSize=" << ((static_cast<int>(selected->width) == g_captureWidth && static_cast<int>(selected->height) == g_captureHeight) ? L"true" : L"false");
+        ss << L"D3D11 depth candidate validation selected dsv=0x" << std::hex << bestExactNonZero->dsv << std::dec
+           << L" nonZero=" << bestExactStats.nonZero
+           << L" exactSize=true";
         LogLineNoLock(ss.str());
-        return selected;
+        return bestExactNonZero;
     }
 
     if (!sampledAnyCandidate)
     {
         LogLineNoLock(L"D3D11 depth candidate validation could not sample any readable candidate; falling back to static score");
         return SelectBestReadableDepthNoLock();
+    }
+
+    if (bestAnyNonZero != nullptr)
+    {
+        std::wstringstream ss;
+        ss << L"D3D11 depth candidate validation found nonzero candidates, but none matched requested size "
+           << g_captureWidth << L"x" << g_captureHeight
+           << L"; bestNonExact dsv=0x" << std::hex << bestAnyNonZero->dsv << std::dec
+           << L" size=" << bestAnyNonZero->width << L"x" << bestAnyNonZero->height
+           << L" nonZero=" << bestAnyStats.nonZero;
+        SetLastErrorText(ss.str());
+        LogLineNoLock(g_lastError);
+        return nullptr;
     }
 
     SetLastErrorText(L"D3D11 depth candidate validation found only empty readable candidates");
@@ -1560,9 +1571,6 @@ void StoreUnityDeviceNoLock(void* device, int deviceType, int eventType)
 
 void TryInstallUnityContextHooksNoLock(const wchar_t* source)
 {
-    if (g_unityContextHooksInstalled)
-        return;
-
     if (g_unityDevice == nullptr)
     {
         LogLineNoLock(L"Unity D3D11 device is not available for context hook");

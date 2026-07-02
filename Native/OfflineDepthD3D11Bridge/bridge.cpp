@@ -39,6 +39,13 @@ enum ContextVTableIndex
     kClearRenderTargetView = 50,
     kClearDepthStencilView = 53,
     kResolveSubresource = 57,
+    kExecuteCommandList = 58,
+    kFinishCommandList = 114,
+};
+
+enum DeviceVTableIndex
+{
+    kCreateDeferredContext = 27,
 };
 
 struct HookSlot
@@ -103,6 +110,9 @@ struct Texture2DInfo
 struct RenderPassStats
 {
     UINT serial = 0;
+    uintptr_t context = 0;
+    D3D11_DEVICE_CONTEXT_TYPE contextType = D3D11_DEVICE_CONTEXT_IMMEDIATE;
+    std::wstring contextLabel;
     Texture2DInfo rtv0;
     Texture2DInfo dsv;
     bool hasViewport = false;
@@ -126,11 +136,37 @@ struct ResourceTransferStats
 {
     UINT serial = 0;
     const wchar_t* op = L"";
+    uintptr_t context = 0;
+    D3D11_DEVICE_CONTEXT_TYPE contextType = D3D11_DEVICE_CONTEXT_IMMEDIATE;
+    std::wstring contextLabel;
     Texture2DInfo dst;
     Texture2DInfo src;
     DXGI_FORMAT resolveFormat = DXGI_FORMAT_UNKNOWN;
 };
 
+struct ContextInfo
+{
+    D3D11_DEVICE_CONTEXT_TYPE type = D3D11_DEVICE_CONTEXT_IMMEDIATE;
+    std::wstring label;
+    UINT hookInstallCount = 0;
+};
+
+struct ContextRuntimeState
+{
+    uintptr_t currentDsv = 0;
+    uintptr_t currentRtv0 = 0;
+    UINT currentPassSerial = 0;
+    D3D11_VIEWPORT viewport{};
+    bool hasViewport = false;
+    uintptr_t depthState = 0;
+    bool hasDepthState = false;
+    BOOL depthEnable = TRUE;
+    D3D11_DEPTH_WRITE_MASK depthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    D3D11_COMPARISON_FUNC depthFunc = D3D11_COMPARISON_LESS;
+    UINT stencilRef = 0;
+};
+
+using CreateDeferredContextFn = HRESULT (STDMETHODCALLTYPE*)(ID3D11Device*, UINT, ID3D11DeviceContext**);
 using OMSetRenderTargetsFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
 using OMSetRenderTargetsAndUAVFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*, UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*);
 using OMSetDepthStencilStateFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilState*, UINT);
@@ -140,6 +176,8 @@ using ClearDepthStencilViewFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, 
 using CopyResourceFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*);
 using CopySubresourceRegionFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, UINT, UINT, UINT, ID3D11Resource*, UINT, const D3D11_BOX*);
 using ResolveSubresourceFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, ID3D11Resource*, UINT, DXGI_FORMAT);
+using ExecuteCommandListFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11CommandList*, BOOL);
+using FinishCommandListFn = HRESULT (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, BOOL, ID3D11CommandList**);
 using DrawIndexedFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 using DrawFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
 using DrawIndexedInstancedFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
@@ -162,6 +200,8 @@ uintptr_t g_currentDsv = 0;
 uintptr_t g_currentRtv0 = 0;
 std::wstring g_captureLabel;
 std::unordered_map<uintptr_t, DsvStats> g_dsvStats;
+std::unordered_map<uintptr_t, ContextInfo> g_contextInfo;
+std::unordered_map<uintptr_t, ContextRuntimeState> g_contextState;
 std::vector<RenderPassStats> g_renderPassStats;
 std::vector<ResourceTransferStats> g_resourceTransferStats;
 UINT g_passSerial = 0;
@@ -179,8 +219,14 @@ UINT g_omSetCalls = 0;
 UINT g_omSetNullDsvCalls = 0;
 UINT g_clearDsvCalls = 0;
 UINT g_drawCalls = 0;
+UINT g_createDeferredContextCalls = 0;
+UINT g_deferredContextHookAttempts = 0;
+UINT g_deferredContextHooksInstalled = 0;
+UINT g_executeCommandListCalls = 0;
+UINT g_finishCommandListCalls = 0;
 ID3D11Device* g_unityDevice = nullptr;
 bool g_unityContextHooksInstalled = false;
+bool g_unityDeviceHooksInstalled = false;
 std::wstring g_pendingDepthRFloatPath;
 std::vector<PendingDepthReadback> g_pendingDepthReadbacks;
 UINT g_depthReadbackSequence = 0;
@@ -189,6 +235,7 @@ bool g_candidateDiagnosticsEnabled = false;
 constexpr UINT kDepthReadbackMapDelay = 1;
 constexpr size_t kMaxPendingDepthReadbacks = 4;
 
+CreateDeferredContextFn g_CreateDeferredContext = nullptr;
 OMSetRenderTargetsFn g_OMSetRenderTargets = nullptr;
 OMSetRenderTargetsAndUAVFn g_OMSetRenderTargetsAndUAV = nullptr;
 OMSetDepthStencilStateFn g_OMSetDepthStencilState = nullptr;
@@ -198,6 +245,8 @@ ClearDepthStencilViewFn g_ClearDepthStencilView = nullptr;
 CopyResourceFn g_CopyResource = nullptr;
 CopySubresourceRegionFn g_CopySubresourceRegion = nullptr;
 ResolveSubresourceFn g_ResolveSubresource = nullptr;
+ExecuteCommandListFn g_ExecuteCommandList = nullptr;
+FinishCommandListFn g_FinishCommandList = nullptr;
 DrawIndexedFn g_DrawIndexed = nullptr;
 DrawFn g_Draw = nullptr;
 DrawIndexedInstancedFn g_DrawIndexedInstanced = nullptr;
@@ -231,6 +280,76 @@ void LogLineNoLock(const std::wstring& line)
 bool IsCaptureActiveNoLock()
 {
     return g_initialized && g_captureActive;
+}
+
+std::wstring ContextTypeToString(D3D11_DEVICE_CONTEXT_TYPE type)
+{
+    switch (type)
+    {
+    case D3D11_DEVICE_CONTEXT_IMMEDIATE:
+        return L"immediate";
+    case D3D11_DEVICE_CONTEXT_DEFERRED:
+        return L"deferred";
+    default:
+        return L"unknown";
+    }
+}
+
+template <typename Fn>
+Fn GetOriginalForVTableSlotNoLock(void* object, int index, Fn fallback)
+{
+    if (object == nullptr)
+        return fallback;
+
+    void** vtable = *reinterpret_cast<void***>(object);
+    void** slot = &vtable[index];
+    for (const auto& hook : g_hooks)
+    {
+        if (hook.slot == slot)
+            return reinterpret_cast<Fn>(hook.original);
+    }
+    return fallback;
+}
+
+ContextInfo RegisterContextNoLock(ID3D11DeviceContext* context, const wchar_t* source)
+{
+    ContextInfo info{};
+    if (context == nullptr)
+        return info;
+
+    const uintptr_t key = reinterpret_cast<uintptr_t>(context);
+    auto existing = g_contextInfo.find(key);
+    if (existing != g_contextInfo.end())
+        info = existing->second;
+
+    info.type = context->GetType();
+    if (source != nullptr && source[0] != L'\0')
+        info.label = source;
+    info.hookInstallCount++;
+    g_contextInfo[key] = info;
+    return info;
+}
+
+ContextInfo GetContextInfoNoLock(ID3D11DeviceContext* context)
+{
+    if (context == nullptr)
+        return ContextInfo{};
+
+    const uintptr_t key = reinterpret_cast<uintptr_t>(context);
+    auto it = g_contextInfo.find(key);
+    if (it != g_contextInfo.end())
+        return it->second;
+
+    ContextInfo info{};
+    info.type = context->GetType();
+    info.label = L"unregistered";
+    g_contextInfo[key] = info;
+    return info;
+}
+
+ContextRuntimeState& GetContextStateNoLock(ID3D11DeviceContext* context)
+{
+    return g_contextState[reinterpret_cast<uintptr_t>(context)];
 }
 
 bool FillTexture2DInfoFromResourceNoLock(ID3D11Resource* resource, Texture2DInfo* info)
@@ -300,6 +419,7 @@ void ClearDsvStatsNoLock()
         }
     }
     g_dsvStats.clear();
+    g_contextState.clear();
     g_renderPassStats.clear();
     g_resourceTransferStats.clear();
     g_currentDsv = 0;
@@ -317,8 +437,11 @@ void ClearDsvStatsNoLock()
     g_currentStencilRef = 0;
 }
 
-void RecordDsvNoLock(ID3D11DepthStencilView* dsv)
+void RecordDsvNoLock(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv)
 {
+    auto& state = GetContextStateNoLock(ctx);
+    state.currentDsv = reinterpret_cast<uintptr_t>(dsv);
+
     if (!IsCaptureActiveNoLock() || dsv == nullptr)
     {
         g_currentDsv = reinterpret_cast<uintptr_t>(dsv);
@@ -366,8 +489,21 @@ void RecordDsvNoLock(ID3D11DepthStencilView* dsv)
     resource->Release();
 }
 
-RenderPassStats* FindCurrentPassNoLock()
+RenderPassStats* FindCurrentPassNoLock(ID3D11DeviceContext* ctx)
 {
+    if (ctx != nullptr)
+    {
+        const auto stateIt = g_contextState.find(reinterpret_cast<uintptr_t>(ctx));
+        if (stateIt != g_contextState.end() && stateIt->second.currentPassSerial != 0)
+        {
+            for (auto it = g_renderPassStats.rbegin(); it != g_renderPassStats.rend(); ++it)
+            {
+                if (it->serial == stateIt->second.currentPassSerial)
+                    return &(*it);
+            }
+        }
+    }
+
     if (g_currentPassSerial == 0)
         return nullptr;
 
@@ -380,7 +516,7 @@ RenderPassStats* FindCurrentPassNoLock()
     return nullptr;
 }
 
-void RecordOmSetNoLock(UINT numRtvs, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv)
+void RecordOmSetNoLock(ID3D11DeviceContext* ctx, UINT numRtvs, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv)
 {
     if (IsCaptureActiveNoLock())
     {
@@ -389,10 +525,13 @@ void RecordOmSetNoLock(UINT numRtvs, ID3D11RenderTargetView* const* rtvs, ID3D11
             g_omSetNullDsvCalls++;
     }
 
-    RecordDsvNoLock(dsv);
+    RecordDsvNoLock(ctx, dsv);
 
     if (!IsCaptureActiveNoLock())
         return;
+
+    auto& state = GetContextStateNoLock(ctx);
+    const ContextInfo contextInfo = GetContextInfoNoLock(ctx);
 
     Texture2DInfo rtvInfo{};
     if (rtvs != nullptr && numRtvs > 0 && rtvs[0] != nullptr)
@@ -403,38 +542,46 @@ void RecordOmSetNoLock(UINT numRtvs, ID3D11RenderTargetView* const* rtvs, ID3D11
         FillTexture2DInfoFromDsvNoLock(dsv, &dsvInfo);
 
     g_currentRtv0 = rtvInfo.view;
+    g_currentDsv = dsvInfo.view;
+    state.currentRtv0 = rtvInfo.view;
+    state.currentDsv = dsvInfo.view;
 
     RenderPassStats pass{};
     pass.serial = ++g_passSerial;
+    pass.context = reinterpret_cast<uintptr_t>(ctx);
+    pass.contextType = contextInfo.type;
+    pass.contextLabel = contextInfo.label;
     pass.rtv0 = rtvInfo;
     pass.dsv = dsvInfo;
-    pass.hasViewport = g_hasCurrentViewport;
-    pass.viewport = g_currentViewport;
-    pass.depthState = g_currentDepthState;
-    pass.hasDepthState = g_hasCurrentDepthState;
-    pass.depthEnable = g_currentDepthEnable;
-    pass.depthWriteMask = g_currentDepthWriteMask;
-    pass.depthFunc = g_currentDepthFunc;
-    pass.stencilRef = g_currentStencilRef;
+    pass.hasViewport = state.hasViewport;
+    pass.viewport = state.viewport;
+    pass.depthState = state.depthState;
+    pass.hasDepthState = state.hasDepthState;
+    pass.depthEnable = state.depthEnable;
+    pass.depthWriteMask = state.depthWriteMask;
+    pass.depthFunc = state.depthFunc;
+    pass.stencilRef = state.stencilRef;
     pass.bindCount = 1;
+    state.currentPassSerial = pass.serial;
     g_currentPassSerial = pass.serial;
     g_renderPassStats.push_back(pass);
 }
 
-void RecordDrawNoLock()
+void RecordDrawNoLock(ID3D11DeviceContext* ctx)
 {
     if (!IsCaptureActiveNoLock())
         return;
 
     g_drawCalls++;
-    if (g_currentDsv == 0)
+    auto& state = GetContextStateNoLock(ctx);
+    if (state.currentDsv == 0)
         return;
 
-    auto it = g_dsvStats.find(g_currentDsv);
+    auto it = g_dsvStats.find(state.currentDsv);
     if (it != g_dsvStats.end())
         it->second.drawCount++;
 
-    auto* pass = FindCurrentPassNoLock();
+    auto* pass = FindCurrentPassNoLock(ctx);
     if (pass != nullptr)
     {
         pass->drawCount++;
@@ -442,18 +589,18 @@ void RecordDrawNoLock()
     }
 }
 
-void RecordClearNoLock(ID3D11DepthStencilView* dsv)
+void RecordClearNoLock(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv)
 {
     if (!IsCaptureActiveNoLock() || dsv == nullptr)
         return;
 
     g_clearDsvCalls++;
-    RecordDsvNoLock(dsv);
+    RecordDsvNoLock(ctx, dsv);
     auto it = g_dsvStats.find(reinterpret_cast<uintptr_t>(dsv));
     if (it != g_dsvStats.end())
         it->second.clearCount++;
 
-    auto* pass = FindCurrentPassNoLock();
+    auto* pass = FindCurrentPassNoLock(ctx);
     if (pass != nullptr && pass->dsv.view == reinterpret_cast<uintptr_t>(dsv))
     {
         pass->clearDsvCount++;
@@ -463,86 +610,107 @@ void RecordClearNoLock(ID3D11DepthStencilView* dsv)
 
 void STDMETHODCALLTYPE Hook_OMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numViews, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv)
 {
+    OMSetRenderTargetsFn original = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        RecordOmSetNoLock(numViews, rtvs, dsv);
+        original = GetOriginalForVTableSlotNoLock(ctx, kOMSetRenderTargets, g_OMSetRenderTargets);
+        RecordOmSetNoLock(ctx, numViews, rtvs, dsv);
     }
-    g_OMSetRenderTargets(ctx, numViews, rtvs, dsv);
+    original(ctx, numViews, rtvs, dsv);
 }
 
 void STDMETHODCALLTYPE Hook_OMSetRenderTargetsAndUAV(ID3D11DeviceContext* ctx, UINT numRtvs, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv, UINT uavStartSlot, UINT numUavs, ID3D11UnorderedAccessView* const* uavs, const UINT* initialCounts)
 {
+    OMSetRenderTargetsAndUAVFn original = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        RecordOmSetNoLock(numRtvs, rtvs, dsv);
+        original = GetOriginalForVTableSlotNoLock(ctx, kOMSetRenderTargetsAndUAV, g_OMSetRenderTargetsAndUAV);
+        RecordOmSetNoLock(ctx, numRtvs, rtvs, dsv);
     }
-    g_OMSetRenderTargetsAndUAV(ctx, numRtvs, rtvs, dsv, uavStartSlot, numUavs, uavs, initialCounts);
+    original(ctx, numRtvs, rtvs, dsv, uavStartSlot, numUavs, uavs, initialCounts);
 }
 
 void STDMETHODCALLTYPE Hook_OMSetDepthStencilState(ID3D11DeviceContext* ctx, ID3D11DepthStencilState* depthStencilState, UINT stencilRef)
 {
+    OMSetDepthStencilStateFn original = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_currentDepthState = reinterpret_cast<uintptr_t>(depthStencilState);
-        g_currentStencilRef = stencilRef;
-        g_hasCurrentDepthState = true;
+        original = GetOriginalForVTableSlotNoLock(ctx, kOMSetDepthStencilState, g_OMSetDepthStencilState);
+        auto& state = GetContextStateNoLock(ctx);
+        state.depthState = reinterpret_cast<uintptr_t>(depthStencilState);
+        state.stencilRef = stencilRef;
+        state.hasDepthState = true;
 
         if (depthStencilState != nullptr)
         {
             D3D11_DEPTH_STENCIL_DESC desc{};
             depthStencilState->GetDesc(&desc);
-            g_currentDepthEnable = desc.DepthEnable;
-            g_currentDepthWriteMask = desc.DepthWriteMask;
-            g_currentDepthFunc = desc.DepthFunc;
+            state.depthEnable = desc.DepthEnable;
+            state.depthWriteMask = desc.DepthWriteMask;
+            state.depthFunc = desc.DepthFunc;
         }
         else
         {
-            g_currentDepthEnable = TRUE;
-            g_currentDepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-            g_currentDepthFunc = D3D11_COMPARISON_LESS;
+            state.depthEnable = TRUE;
+            state.depthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+            state.depthFunc = D3D11_COMPARISON_LESS;
         }
 
-        auto* pass = FindCurrentPassNoLock();
+        g_currentDepthState = state.depthState;
+        g_currentStencilRef = stencilRef;
+        g_hasCurrentDepthState = true;
+        g_currentDepthEnable = state.depthEnable;
+        g_currentDepthWriteMask = state.depthWriteMask;
+        g_currentDepthFunc = state.depthFunc;
+
+        auto* pass = FindCurrentPassNoLock(ctx);
         if (pass != nullptr)
         {
-            pass->depthState = g_currentDepthState;
+            pass->depthState = state.depthState;
             pass->hasDepthState = true;
-            pass->depthEnable = g_currentDepthEnable;
-            pass->depthWriteMask = g_currentDepthWriteMask;
-            pass->depthFunc = g_currentDepthFunc;
-            pass->stencilRef = g_currentStencilRef;
+            pass->depthEnable = state.depthEnable;
+            pass->depthWriteMask = state.depthWriteMask;
+            pass->depthFunc = state.depthFunc;
+            pass->stencilRef = state.stencilRef;
         }
     }
-    g_OMSetDepthStencilState(ctx, depthStencilState, stencilRef);
+    original(ctx, depthStencilState, stencilRef);
 }
 
 void STDMETHODCALLTYPE Hook_RSSetViewports(ID3D11DeviceContext* ctx, UINT numViewports, const D3D11_VIEWPORT* viewports)
 {
+    RSSetViewportsFn original = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
+        original = GetOriginalForVTableSlotNoLock(ctx, kRSSetViewports, g_RSSetViewports);
         if (numViewports > 0 && viewports != nullptr)
         {
-            g_currentViewport = viewports[0];
+            auto& state = GetContextStateNoLock(ctx);
+            state.viewport = viewports[0];
+            state.hasViewport = true;
+            g_currentViewport = state.viewport;
             g_hasCurrentViewport = true;
 
-            auto* pass = FindCurrentPassNoLock();
+            auto* pass = FindCurrentPassNoLock(ctx);
             if (pass != nullptr)
             {
-                pass->viewport = g_currentViewport;
+                pass->viewport = state.viewport;
                 pass->hasViewport = true;
             }
         }
     }
-    g_RSSetViewports(ctx, numViewports, viewports);
+    original(ctx, numViewports, viewports);
 }
 
 void STDMETHODCALLTYPE Hook_ClearRenderTargetView(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv, const FLOAT colorRGBA[4])
 {
+    ClearRenderTargetViewFn original = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
+        original = GetOriginalForVTableSlotNoLock(ctx, kClearRenderTargetView, g_ClearRenderTargetView);
         if (IsCaptureActiveNoLock())
         {
-            auto* pass = FindCurrentPassNoLock();
+            auto* pass = FindCurrentPassNoLock(ctx);
             if (pass != nullptr && pass->rtv0.view == reinterpret_cast<uintptr_t>(rtv))
             {
                 pass->clearRtvCount++;
@@ -550,26 +718,32 @@ void STDMETHODCALLTYPE Hook_ClearRenderTargetView(ID3D11DeviceContext* ctx, ID3D
             }
         }
     }
-    g_ClearRenderTargetView(ctx, rtv, colorRGBA);
+    original(ctx, rtv, colorRGBA);
 }
 
 void STDMETHODCALLTYPE Hook_ClearDepthStencilView(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, UINT clearFlags, FLOAT depth, UINT8 stencil)
 {
+    ClearDepthStencilViewFn original = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        RecordClearNoLock(dsv);
+        original = GetOriginalForVTableSlotNoLock(ctx, kClearDepthStencilView, g_ClearDepthStencilView);
+        RecordClearNoLock(ctx, dsv);
     }
-    g_ClearDepthStencilView(ctx, dsv, clearFlags, depth, stencil);
+    original(ctx, dsv, clearFlags, depth, stencil);
 }
 
-void RecordTransferNoLock(const wchar_t* op, ID3D11Resource* dst, ID3D11Resource* src, DXGI_FORMAT resolveFormat = DXGI_FORMAT_UNKNOWN)
+void RecordTransferNoLock(ID3D11DeviceContext* ctx, const wchar_t* op, ID3D11Resource* dst, ID3D11Resource* src, DXGI_FORMAT resolveFormat = DXGI_FORMAT_UNKNOWN)
 {
     if (!IsCaptureActiveNoLock())
         return;
 
+    const ContextInfo contextInfo = GetContextInfoNoLock(ctx);
     ResourceTransferStats transfer{};
     transfer.serial = ++g_operationSerial;
     transfer.op = op;
+    transfer.context = reinterpret_cast<uintptr_t>(ctx);
+    transfer.contextType = contextInfo.type;
+    transfer.contextLabel = contextInfo.label;
     transfer.resolveFormat = resolveFormat;
     FillTexture2DInfoFromResourceNoLock(dst, &transfer.dst);
     FillTexture2DInfoFromResourceNoLock(src, &transfer.src);
@@ -584,62 +758,96 @@ void RecordTransferNoLock(const wchar_t* op, ID3D11Resource* dst, ID3D11Resource
 
 void STDMETHODCALLTYPE Hook_CopyResource(ID3D11DeviceContext* ctx, ID3D11Resource* dstResource, ID3D11Resource* srcResource)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordTransferNoLock(L"CopyResource", dstResource, srcResource); }
-    g_CopyResource(ctx, dstResource, srcResource);
+    CopyResourceFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kCopyResource, g_CopyResource); RecordTransferNoLock(ctx, L"CopyResource", dstResource, srcResource); }
+    original(ctx, dstResource, srcResource);
 }
 
 void STDMETHODCALLTYPE Hook_CopySubresourceRegion(ID3D11DeviceContext* ctx, ID3D11Resource* dstResource, UINT dstSubresource, UINT dstX, UINT dstY, UINT dstZ, ID3D11Resource* srcResource, UINT srcSubresource, const D3D11_BOX* srcBox)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordTransferNoLock(L"CopySubresourceRegion", dstResource, srcResource); }
-    g_CopySubresourceRegion(ctx, dstResource, dstSubresource, dstX, dstY, dstZ, srcResource, srcSubresource, srcBox);
+    CopySubresourceRegionFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kCopySubresourceRegion, g_CopySubresourceRegion); RecordTransferNoLock(ctx, L"CopySubresourceRegion", dstResource, srcResource); }
+    original(ctx, dstResource, dstSubresource, dstX, dstY, dstZ, srcResource, srcSubresource, srcBox);
 }
 
 void STDMETHODCALLTYPE Hook_ResolveSubresource(ID3D11DeviceContext* ctx, ID3D11Resource* dstResource, UINT dstSubresource, ID3D11Resource* srcResource, UINT srcSubresource, DXGI_FORMAT format)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordTransferNoLock(L"ResolveSubresource", dstResource, srcResource, format); }
-    g_ResolveSubresource(ctx, dstResource, dstSubresource, srcResource, srcSubresource, format);
+    ResolveSubresourceFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kResolveSubresource, g_ResolveSubresource); RecordTransferNoLock(ctx, L"ResolveSubresource", dstResource, srcResource, format); }
+    original(ctx, dstResource, dstSubresource, srcResource, srcSubresource, format);
 }
 
 void STDMETHODCALLTYPE Hook_DrawIndexed(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndexLocation, INT baseVertexLocation)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordDrawNoLock(); }
-    g_DrawIndexed(ctx, indexCount, startIndexLocation, baseVertexLocation);
+    DrawIndexedFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kDrawIndexed, g_DrawIndexed); RecordDrawNoLock(ctx); }
+    original(ctx, indexCount, startIndexLocation, baseVertexLocation);
 }
 
 void STDMETHODCALLTYPE Hook_Draw(ID3D11DeviceContext* ctx, UINT vertexCount, UINT startVertexLocation)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordDrawNoLock(); }
-    g_Draw(ctx, vertexCount, startVertexLocation);
+    DrawFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kDraw, g_Draw); RecordDrawNoLock(ctx); }
+    original(ctx, vertexCount, startVertexLocation);
 }
 
 void STDMETHODCALLTYPE Hook_DrawIndexedInstanced(ID3D11DeviceContext* ctx, UINT indexCountPerInstance, UINT instanceCount, UINT startIndexLocation, INT baseVertexLocation, UINT startInstanceLocation)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordDrawNoLock(); }
-    g_DrawIndexedInstanced(ctx, indexCountPerInstance, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation);
+    DrawIndexedInstancedFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kDrawIndexedInstanced, g_DrawIndexedInstanced); RecordDrawNoLock(ctx); }
+    original(ctx, indexCountPerInstance, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation);
 }
 
 void STDMETHODCALLTYPE Hook_DrawInstanced(ID3D11DeviceContext* ctx, UINT vertexCountPerInstance, UINT instanceCount, UINT startVertexLocation, UINT startInstanceLocation)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordDrawNoLock(); }
-    g_DrawInstanced(ctx, vertexCountPerInstance, instanceCount, startVertexLocation, startInstanceLocation);
+    DrawInstancedFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kDrawInstanced, g_DrawInstanced); RecordDrawNoLock(ctx); }
+    original(ctx, vertexCountPerInstance, instanceCount, startVertexLocation, startInstanceLocation);
 }
 
 void STDMETHODCALLTYPE Hook_DrawAuto(ID3D11DeviceContext* ctx)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordDrawNoLock(); }
-    g_DrawAuto(ctx);
+    DrawAutoFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kDrawAuto, g_DrawAuto); RecordDrawNoLock(ctx); }
+    original(ctx);
 }
 
 void STDMETHODCALLTYPE Hook_DrawIndexedInstancedIndirect(ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT alignedByteOffsetForArgs)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordDrawNoLock(); }
-    g_DrawIndexedInstancedIndirect(ctx, args, alignedByteOffsetForArgs);
+    DrawIndexedInstancedIndirectFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kDrawIndexedInstancedIndirect, g_DrawIndexedInstancedIndirect); RecordDrawNoLock(ctx); }
+    original(ctx, args, alignedByteOffsetForArgs);
 }
 
 void STDMETHODCALLTYPE Hook_DrawInstancedIndirect(ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT alignedByteOffsetForArgs)
 {
-    { std::lock_guard<std::mutex> lock(g_mutex); RecordDrawNoLock(); }
-    g_DrawInstancedIndirect(ctx, args, alignedByteOffsetForArgs);
+    DrawInstancedIndirectFn original = nullptr;
+    { std::lock_guard<std::mutex> lock(g_mutex); original = GetOriginalForVTableSlotNoLock(ctx, kDrawInstancedIndirect, g_DrawInstancedIndirect); RecordDrawNoLock(ctx); }
+    original(ctx, args, alignedByteOffsetForArgs);
+}
+
+void STDMETHODCALLTYPE Hook_ExecuteCommandList(ID3D11DeviceContext* ctx, ID3D11CommandList* commandList, BOOL restoreContextState)
+{
+    ExecuteCommandListFn original = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        original = GetOriginalForVTableSlotNoLock(ctx, kExecuteCommandList, g_ExecuteCommandList);
+        if (IsCaptureActiveNoLock())
+            g_executeCommandListCalls++;
+    }
+    original(ctx, commandList, restoreContextState);
+}
+
+HRESULT STDMETHODCALLTYPE Hook_FinishCommandList(ID3D11DeviceContext* ctx, BOOL restoreDeferredContextState, ID3D11CommandList** commandList)
+{
+    FinishCommandListFn original = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        original = GetOriginalForVTableSlotNoLock(ctx, kFinishCommandList, g_FinishCommandList);
+        if (IsCaptureActiveNoLock())
+            g_finishCommandListCalls++;
+    }
+    return original(ctx, restoreDeferredContextState, commandList);
 }
 
 bool ReplaceVTableSlot(void** vtable, int index, void* replacement, void** originalOut)
@@ -699,6 +907,8 @@ bool InstallHooksForContextNoLock(ID3D11DeviceContext* context, const wchar_t* s
     INSTALL_CONTEXT_HOOK(kClearRenderTargetView, Hook_ClearRenderTargetView, ClearRenderTargetViewFn, g_ClearRenderTargetView);
     INSTALL_CONTEXT_HOOK(kClearDepthStencilView, Hook_ClearDepthStencilView, ClearDepthStencilViewFn, g_ClearDepthStencilView);
     INSTALL_CONTEXT_HOOK(kResolveSubresource, Hook_ResolveSubresource, ResolveSubresourceFn, g_ResolveSubresource);
+    INSTALL_CONTEXT_HOOK(kExecuteCommandList, Hook_ExecuteCommandList, ExecuteCommandListFn, g_ExecuteCommandList);
+    INSTALL_CONTEXT_HOOK(kFinishCommandList, Hook_FinishCommandList, FinishCommandListFn, g_FinishCommandList);
     INSTALL_CONTEXT_HOOK(kDrawIndexed, Hook_DrawIndexed, DrawIndexedFn, g_DrawIndexed);
     INSTALL_CONTEXT_HOOK(kDraw, Hook_Draw, DrawFn, g_Draw);
     INSTALL_CONTEXT_HOOK(kDrawIndexedInstanced, Hook_DrawIndexedInstanced, DrawIndexedInstancedFn, g_DrawIndexedInstanced);
@@ -709,10 +919,80 @@ bool InstallHooksForContextNoLock(ID3D11DeviceContext* context, const wchar_t* s
 
 #undef INSTALL_CONTEXT_HOOK
 
+    const ContextInfo contextInfo = RegisterContextNoLock(context, source);
     std::wstringstream ss;
     ss << L"hooks " << (ok ? L"installed" : L"failed") << L" for " << source
-       << L" context=0x" << std::hex << reinterpret_cast<uintptr_t>(context);
+       << L" context=0x" << std::hex << reinterpret_cast<uintptr_t>(context) << std::dec
+       << L" contextType=" << ContextTypeToString(contextInfo.type)
+       << L" installs=" << contextInfo.hookInstallCount;
     LogLineNoLock(ss.str());
+    return ok;
+}
+
+HRESULT STDMETHODCALLTYPE Hook_CreateDeferredContext(ID3D11Device* device, UINT contextFlags, ID3D11DeviceContext** deferredContext)
+{
+    CreateDeferredContextFn original = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        original = GetOriginalForVTableSlotNoLock(device, kCreateDeferredContext, g_CreateDeferredContext);
+        if (IsCaptureActiveNoLock())
+            g_createDeferredContextCalls++;
+    }
+
+    if (original == nullptr)
+        return E_FAIL;
+
+    const HRESULT hr = original(device, contextFlags, deferredContext);
+    if (SUCCEEDED(hr) && deferredContext != nullptr && *deferredContext != nullptr)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_deferredContextHookAttempts++;
+        if (InstallHooksForContextNoLock(*deferredContext, L"CreateDeferredContext"))
+            g_deferredContextHooksInstalled++;
+    }
+    return hr;
+}
+
+bool InstallHooksForDeviceNoLock(ID3D11Device* device, const wchar_t* source)
+{
+    if (device == nullptr)
+        return false;
+
+    void** vtable = *reinterpret_cast<void***>(device);
+    void* original = nullptr;
+    bool ok = ReplaceVTableSlot(vtable, kCreateDeferredContext, reinterpret_cast<void*>(&Hook_CreateDeferredContext), &original);
+    if (ok && g_CreateDeferredContext == nullptr && original != nullptr)
+        g_CreateDeferredContext = reinterpret_cast<CreateDeferredContextFn>(original);
+
+    std::wstringstream ss;
+    ss << L"device hooks " << (ok ? L"installed" : L"failed") << L" for " << source
+       << L" device=0x" << std::hex << reinterpret_cast<uintptr_t>(device);
+    LogLineNoLock(ss.str());
+
+    CreateDeferredContextFn createDeferred = reinterpret_cast<CreateDeferredContextFn>(original);
+    if (createDeferred == nullptr)
+        createDeferred = g_CreateDeferredContext;
+
+    if (createDeferred != nullptr)
+    {
+        ID3D11DeviceContext* deferred = nullptr;
+        HRESULT hr = createDeferred(device, 0, &deferred);
+        if (SUCCEEDED(hr) && deferred != nullptr)
+        {
+            g_deferredContextHookAttempts++;
+            if (InstallHooksForContextNoLock(deferred, source))
+                g_deferredContextHooksInstalled++;
+            deferred->Release();
+        }
+        else
+        {
+            std::wstringstream fail;
+            fail << L"temporary deferred context creation failed for " << source
+                 << L" hr=0x" << std::hex << static_cast<unsigned>(hr);
+            LogLineNoLock(fail.str());
+        }
+    }
+
     return ok;
 }
 
@@ -734,7 +1014,8 @@ bool InstallHooks()
         return false;
     }
 
-    bool ok = InstallHooksForContextNoLock(context, L"dummy D3D11");
+    bool ok = InstallHooksForContextNoLock(context, L"dummy D3D11 immediate");
+    ok &= InstallHooksForDeviceNoLock(device, L"dummy D3D11 deferred");
 
     context->Release();
     device->Release();
@@ -1809,8 +2090,26 @@ void WriteCaptureSummaryNoLock()
     counters << L"  hook counters: OMSet=" << g_omSetCalls
              << L" nullDSV=" << g_omSetNullDsvCalls
              << L" ClearDepthStencilView=" << g_clearDsvCalls
-             << L" Draw=" << g_drawCalls;
+             << L" Draw=" << g_drawCalls
+             << L" CreateDeferredContext=" << g_createDeferredContextCalls
+             << L" deferredHookAttempts=" << g_deferredContextHookAttempts
+             << L" deferredHooksInstalled=" << g_deferredContextHooksInstalled
+             << L" FinishCommandList=" << g_finishCommandListCalls
+             << L" ExecuteCommandList=" << g_executeCommandListCalls;
     LogLineNoLock(counters.str());
+
+    std::wstringstream contexts;
+    contexts << L"  contexts known=" << g_contextInfo.size();
+    LogLineNoLock(contexts.str());
+    for (const auto& kv : g_contextInfo)
+    {
+        std::wstringstream line;
+        line << L"  context=0x" << std::hex << kv.first << std::dec
+             << L" type=" << ContextTypeToString(kv.second.type)
+             << L" label=\"" << kv.second.label << L"\""
+             << L" installs=" << kv.second.hookInstallCount;
+        LogLineNoLock(line.str());
+    }
 
     if (g_dsvStats.empty())
     {
@@ -1868,6 +2167,9 @@ void WriteCaptureSummaryNoLock()
     {
         std::wstringstream line;
         line << L"  pass#" << pass.serial
+             << L" context=0x" << std::hex << pass.context << std::dec
+             << L" contextType=" << ContextTypeToString(pass.contextType)
+             << L" contextLabel=\"" << pass.contextLabel << L"\""
              << L" rtv=0x" << std::hex << pass.rtv0.view
              << L" rtvRes=0x" << pass.rtv0.resource << std::dec
              << L" rtvSize=" << pass.rtv0.width << L"x" << pass.rtv0.height
@@ -1911,6 +2213,9 @@ void WriteCaptureSummaryNoLock()
         std::wstringstream line;
         line << L"  transfer#" << transfer.serial
              << L" op=" << transfer.op
+             << L" context=0x" << std::hex << transfer.context << std::dec
+             << L" contextType=" << ContextTypeToString(transfer.contextType)
+             << L" contextLabel=\"" << transfer.contextLabel << L"\""
              << L" dst=0x" << std::hex << transfer.dst.resource
              << L" src=0x" << transfer.src.resource << std::dec
              << L" dstSize=" << transfer.dst.width << L"x" << transfer.dst.height
@@ -1937,6 +2242,7 @@ void StoreUnityDeviceNoLock(void* device, int deviceType, int eventType)
         g_unityDevice->Release();
         g_unityDevice = nullptr;
         g_unityContextHooksInstalled = false;
+        g_unityDeviceHooksInstalled = false;
     }
 
     if (device == nullptr)
@@ -1954,6 +2260,7 @@ void StoreUnityDeviceNoLock(void* device, int deviceType, int eventType)
 
     g_unityDevice = d3dDevice;
     LogLineNoLock(L"Unity D3D11 device stored");
+    g_unityDeviceHooksInstalled = InstallHooksForDeviceNoLock(g_unityDevice, L"UnitySetGraphicsDevice");
 }
 
 void TryInstallUnityContextHooksNoLock(const wchar_t* source)
@@ -1963,6 +2270,9 @@ void TryInstallUnityContextHooksNoLock(const wchar_t* source)
         LogLineNoLock(L"Unity D3D11 device is not available for context hook");
         return;
     }
+
+    if (!g_unityDeviceHooksInstalled)
+        g_unityDeviceHooksInstalled = InstallHooksForDeviceNoLock(g_unityDevice, source);
 
     ID3D11DeviceContext* context = nullptr;
     g_unityDevice->GetImmediateContext(&context);
@@ -2021,11 +2331,15 @@ bool StoreUnityDeviceFromTextureNoLock(void* nativeTexture)
             same << L"D3D11 device already stored from native texture size=" << desc.Width << L"x" << desc.Height
                  << L" format=" << FormatToString(desc.Format);
             LogLineNoLock(same.str());
+            if (!g_unityDeviceHooksInstalled)
+                g_unityDeviceHooksInstalled = InstallHooksForDeviceNoLock(g_unityDevice, L"native texture existing device");
+            TryInstallUnityContextHooksNoLock(L"native texture existing device");
             return true;
         }
 
         g_unityDevice->Release();
         g_unityContextHooksInstalled = false;
+        g_unityDeviceHooksInstalled = false;
     }
 
     g_unityDevice = device;
@@ -2034,6 +2348,7 @@ bool StoreUnityDeviceFromTextureNoLock(void* nativeTexture)
        << L" format=" << FormatToString(desc.Format)
        << L" bindFlags=0x" << std::hex << desc.BindFlags;
     LogLineNoLock(ok.str());
+    g_unityDeviceHooksInstalled = InstallHooksForDeviceNoLock(g_unityDevice, L"native texture device");
     TryInstallUnityContextHooksNoLock(L"native texture device");
     return true;
 }
@@ -2230,6 +2545,7 @@ extern "C" __declspec(dllexport) int ORS_Shutdown()
         g_unityDevice = nullptr;
     }
     g_unityContextHooksInstalled = false;
+    g_unityDeviceHooksInstalled = false;
     g_pendingDepthRFloatPath.clear();
     LogLineNoLock(L"shutdown");
     g_log.close();
@@ -2256,6 +2572,11 @@ extern "C" __declspec(dllexport) int ORS_BeginCapture(int width, int height, con
     g_omSetNullDsvCalls = 0;
     g_clearDsvCalls = 0;
     g_drawCalls = 0;
+    g_createDeferredContextCalls = 0;
+    g_deferredContextHookAttempts = 0;
+    g_deferredContextHooksInstalled = 0;
+    g_executeCommandListCalls = 0;
+    g_finishCommandListCalls = 0;
     g_pendingDepthRFloatPath.clear();
     g_lastDepthQueueResult = 0;
     g_captureActive = true;

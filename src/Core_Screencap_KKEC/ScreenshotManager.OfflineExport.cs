@@ -23,6 +23,7 @@ namespace Screencap
         private static ConfigEntry<string> OfflineReShadeD3D11DepthBridgeDllPath { get; set; }
         private static ConfigEntry<string> OfflineReShadeD3D11DepthBridgeLogPath { get; set; }
         private static ConfigEntry<bool> OfflineReShadeD3D11CandidateDiagnosticsEnabled { get; set; }
+        private static ConfigEntry<bool> OfflineReShadeKkEnvironmentFingerprintEnabled { get; set; }
         private static bool _kkDepthMissingHintLogged;
 #endif
 
@@ -329,6 +330,144 @@ namespace Screencap
             }
         }
 
+        private static object GetPropertyValue(object instance, string propertyName)
+        {
+            if (instance == null || string.IsNullOrEmpty(propertyName))
+                return null;
+
+            try
+            {
+                var property = instance.GetType().GetProperty(propertyName);
+                return property != null ? property.GetValue(instance, null) : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string GetTransformPath(Transform transform)
+        {
+            if (transform == null)
+                return "<null>";
+
+            var path = transform.name;
+            var parent = transform.parent;
+            while (parent != null)
+            {
+                path = parent.name + "/" + path;
+                parent = parent.parent;
+            }
+            return path;
+        }
+
+        private static string FormatVec3(Vector3 value)
+        {
+            return value.x.ToString("0.###", CultureInfo.InvariantCulture) + "," +
+                   value.y.ToString("0.###", CultureInfo.InvariantCulture) + "," +
+                   value.z.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+
+        private static string FormatRect(Rect value)
+        {
+            return value.x.ToString("0.###", CultureInfo.InvariantCulture) + "," +
+                   value.y.ToString("0.###", CultureInfo.InvariantCulture) + "," +
+                   value.width.ToString("0.###", CultureInfo.InvariantCulture) + "x" +
+                   value.height.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+
+        private static void AppendLine(StringBuilder builder, string key, object value)
+        {
+            builder.Append("[OfflineReShadeEnv] ").Append(key).Append("=").Append(value ?? "<null>").AppendLine();
+        }
+
+        private static void AppendCameraFingerprint(StringBuilder builder, string prefix, Camera cam)
+        {
+            if (cam == null)
+            {
+                AppendLine(builder, prefix, "<null>");
+                return;
+            }
+
+            AppendLine(builder, prefix + ".name", cam.name);
+            AppendLine(builder, prefix + ".path", GetTransformPath(cam.transform));
+            AppendLine(builder, prefix + ".enabled", cam.enabled);
+            AppendLine(builder, prefix + ".activeInHierarchy", cam.gameObject.activeInHierarchy);
+            AppendLine(builder, prefix + ".tag", cam.tag);
+            AppendLine(builder, prefix + ".actualRenderingPath", cam.actualRenderingPath);
+            AppendLine(builder, prefix + ".renderingPath", cam.renderingPath);
+            AppendLine(builder, prefix + ".depthTextureMode", cam.depthTextureMode);
+            AppendLine(builder, prefix + ".clearFlags", cam.clearFlags);
+            AppendLine(builder, prefix + ".cullingMask", "0x" + cam.cullingMask.ToString("X8", CultureInfo.InvariantCulture));
+            AppendLine(builder, prefix + ".nearFar", cam.nearClipPlane.ToString("0.######", CultureInfo.InvariantCulture) + "/" + cam.farClipPlane.ToString("0.######", CultureInfo.InvariantCulture));
+            AppendLine(builder, prefix + ".fovAspect", cam.fieldOfView.ToString("0.###", CultureInfo.InvariantCulture) + "/" + cam.aspect.ToString("0.######", CultureInfo.InvariantCulture));
+            AppendLine(builder, prefix + ".rect", FormatRect(cam.rect));
+            AppendLine(builder, prefix + ".pixelRect", FormatRect(cam.pixelRect));
+            AppendLine(builder, prefix + ".depth", cam.depth);
+            AppendLine(builder, prefix + ".position", FormatVec3(cam.transform.position));
+            AppendLine(builder, prefix + ".rotation", FormatVec3(cam.transform.eulerAngles));
+            AppendLine(builder, prefix + ".targetTexture", cam.targetTexture != null ? cam.targetTexture.width + "x" + cam.targetTexture.height + " depth=" + cam.targetTexture.depth + " format=" + cam.targetTexture.format : "<null>");
+            AppendLine(builder, prefix + ".allowHDR", GetPropertyValue(cam, "allowHDR") ?? "<unavailable>");
+            AppendLine(builder, prefix + ".allowMSAA", GetPropertyValue(cam, "allowMSAA") ?? "<unavailable>");
+
+            var effects = cam.GetComponents<MonoBehaviour>();
+            var effectList = new StringBuilder();
+            for (var i = 0; i < effects.Length; i++)
+            {
+                var effect = effects[i];
+                if (effect == null)
+                    continue;
+
+                if (effectList.Length > 0)
+                    effectList.Append("; ");
+                effectList.Append(effect.GetType().FullName).Append(" enabled=").Append(effect.enabled);
+            }
+            AppendLine(builder, prefix + ".monoBehaviours", effectList.Length > 0 ? effectList.ToString() : "<none>");
+        }
+
+        private static void LogKkEnvironmentFingerprint(string context, int width, int height, int downscaling, int renderWidth, int renderHeight, Camera cam)
+        {
+            if (OfflineReShadeKkEnvironmentFingerprintEnabled == null || !OfflineReShadeKkEnvironmentFingerprintEnabled.Value)
+                return;
+
+            var builder = new StringBuilder();
+            AppendLine(builder, "context", context);
+            AppendLine(builder, "requested", width + "x" + height + " downscaling=" + downscaling + " render=" + renderWidth + "x" + renderHeight);
+            AppendLine(builder, "unity", Application.unityVersion + " platform=" + Application.platform + " product=" + Application.productName + " version=" + Application.version);
+            AppendLine(builder, "app", "runInBackground=" + Application.runInBackground + " isFocused=" + Application.isFocused + " targetFrameRate=" + Application.targetFrameRate);
+            AppendLine(builder, "system", SystemInfo.operatingSystem + " cpu=" + SystemInfo.processorType + " cores=" + SystemInfo.processorCount + " memMB=" + SystemInfo.systemMemorySize);
+            AppendLine(builder, "graphics", SystemInfo.graphicsDeviceName + " vendor=" + SystemInfo.graphicsDeviceVendor + " version=" + SystemInfo.graphicsDeviceVersion + " type=" + SystemInfo.graphicsDeviceType + " memMB=" + SystemInfo.graphicsMemorySize + " multiThreaded=" + SystemInfo.graphicsMultiThreaded + " reversedZ=" + SystemInfo.usesReversedZBuffer);
+            AppendLine(builder, "screen", Screen.width + "x" + Screen.height + " fullScreen=" + Screen.fullScreen + " currentResolution=" + Screen.currentResolution.width + "x" + Screen.currentResolution.height + "@" + Screen.currentResolution.refreshRate);
+            AppendLine(builder, "quality", "level=" + QualitySettings.GetQualityLevel() + " aa=" + QualitySettings.antiAliasing + " vSync=" + QualitySettings.vSyncCount + " shadows=" + QualitySettings.shadows + " shadowDistance=" + QualitySettings.shadowDistance + " masterTextureLimit=" + QualitySettings.masterTextureLimit);
+            AppendLine(builder, "time", "frame=" + Time.frameCount + " timeScale=" + Time.timeScale.ToString("0.###", CultureInfo.InvariantCulture) + " realtime=" + Time.realtimeSinceStartup.ToString("0.###", CultureInfo.InvariantCulture));
+            AppendCameraFingerprint(builder, "camera.main", cam);
+
+            var cameras = Camera.allCameras;
+            AppendLine(builder, "allCameras.count", cameras != null ? cameras.Length : 0);
+            if (cameras != null)
+            {
+                for (var i = 0; i < cameras.Length; i++)
+                    AppendCameraFingerprint(builder, "allCameras[" + i + "]", cameras[i]);
+            }
+
+            var text = builder.ToString().TrimEnd();
+            Logger.LogInfo(text);
+
+            try
+            {
+                var logPath = OfflineReShadeD3D11DepthBridgeLogPath != null ? Path.GetFullPath(OfflineReShadeD3D11DepthBridgeLogPath.Value) : null;
+                if (!string.IsNullOrEmpty(logPath))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+                    File.AppendAllText(logPath, text + Environment.NewLine, Encoding.UTF8);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("Offline ReShade KK environment fingerprint log write failed: " + ex.Message);
+            }
+        }
+
         private static void LogKkDepthMissingHint(string context)
         {
             var reason = D3D11DepthBridge.GetLastError();
@@ -403,6 +542,12 @@ namespace Screencap
                 "D3D11 bridge candidate diagnostics",
                 false,
                 "When enabled, the native D3D11 bridge samples every readable DSV candidate and logs nonzero/min/max stats. This is slow and intended only for debugging empty or wrong depth frames.");
+
+            OfflineReShadeKkEnvironmentFingerprintEnabled = Config.Bind(
+                "Offline ReShade Export",
+                "KK environment fingerprint log",
+                true,
+                "Writes a KK-only environment/camera/settings fingerprint to the game log and D3D11 bridge log for comparing machines with unstable depth capture.");
 #endif
         }
 
@@ -509,6 +654,10 @@ namespace Screencap
                 oldDofBlurSize = dof.maxBlurSize;
                 dof.maxBlurSize = renderWidth * oldDofBlurSize / Screen.width;
             }
+
+#if KK
+            LogKkEnvironmentFingerprint(timingLabel ?? "Offline ReShade", width, height, safeDownscaling, renderWidth, renderHeight, cam);
+#endif
 
             var colorRt = RenderTexture.GetTemporary(renderWidth, renderHeight, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Default, 1);
             var depthKind = OfflineDepthTextureKind.DeviceRFloat;

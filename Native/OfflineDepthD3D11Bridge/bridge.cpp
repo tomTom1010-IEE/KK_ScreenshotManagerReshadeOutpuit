@@ -35,6 +35,11 @@ enum ContextVTableIndex
     kClearDepthStencilView = 53,
 };
 
+enum DeviceVTableIndex
+{
+    kCreateDeferredContext = 27,
+};
+
 struct HookSlot
 {
     void** slot = nullptr;
@@ -91,6 +96,7 @@ using DrawInstancedFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UI
 using DrawAutoFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*);
 using DrawIndexedInstancedIndirectFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
 using DrawInstancedIndirectFn = void (STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+using CreateDeferredContextFn = HRESULT (STDMETHODCALLTYPE*)(ID3D11Device*, UINT, ID3D11DeviceContext**);
 
 std::mutex g_mutex;
 std::wofstream g_log;
@@ -129,6 +135,10 @@ DrawInstancedFn g_DrawInstanced = nullptr;
 DrawAutoFn g_DrawAuto = nullptr;
 DrawIndexedInstancedIndirectFn g_DrawIndexedInstancedIndirect = nullptr;
 DrawInstancedIndirectFn g_DrawInstancedIndirect = nullptr;
+CreateDeferredContextFn g_CreateDeferredContext = nullptr;
+
+bool InstallHooksForContextNoLock(ID3D11DeviceContext* context, const wchar_t* source);
+bool InstallHooksForDeviceNoLock(ID3D11Device* device, const wchar_t* source);
 
 void SetLastErrorText(const std::wstring& message)
 {
@@ -326,6 +336,17 @@ void STDMETHODCALLTYPE Hook_DrawInstancedIndirect(ID3D11DeviceContext* ctx, ID3D
     g_DrawInstancedIndirect(ctx, args, alignedByteOffsetForArgs);
 }
 
+HRESULT STDMETHODCALLTYPE Hook_CreateDeferredContext(ID3D11Device* device, UINT contextFlags, ID3D11DeviceContext** deferredContext)
+{
+    const HRESULT hr = g_CreateDeferredContext(device, contextFlags, deferredContext);
+    if (SUCCEEDED(hr) && deferredContext != nullptr && *deferredContext != nullptr)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        InstallHooksForContextNoLock(*deferredContext, L"CreateDeferredContext");
+    }
+    return hr;
+}
+
 bool ReplaceVTableSlot(void** vtable, int index, void* replacement, void** originalOut)
 {
     void** slot = &vtable[index];
@@ -335,6 +356,21 @@ bool ReplaceVTableSlot(void** vtable, int index, void* replacement, void** origi
         {
             if (originalOut != nullptr)
                 *originalOut = hook.original;
+
+            if (*slot == replacement)
+                return true;
+
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
+                return false;
+
+            *slot = replacement;
+            VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void*));
+
+            std::wstringstream ss;
+            ss << L"repaired D3D11 vtable hook index=" << index << L" slot=0x" << std::hex << reinterpret_cast<uintptr_t>(slot);
+            LogLineNoLock(ss.str());
             return true;
         }
     }
@@ -394,6 +430,33 @@ bool InstallHooksForContextNoLock(ID3D11DeviceContext* context, const wchar_t* s
     return ok;
 }
 
+bool InstallHooksForDeviceNoLock(ID3D11Device* device, const wchar_t* source)
+{
+    if (device == nullptr)
+        return false;
+
+    void** vtable = *reinterpret_cast<void***>(device);
+    void* original = nullptr;
+    const bool ok = ReplaceVTableSlot(vtable, kCreateDeferredContext, reinterpret_cast<void*>(&Hook_CreateDeferredContext), &original);
+    if (ok && g_CreateDeferredContext == nullptr && original != nullptr)
+        g_CreateDeferredContext = reinterpret_cast<CreateDeferredContextFn>(original);
+
+    std::wstringstream ss;
+    ss << L"device hooks " << (ok ? L"installed" : L"failed") << L" for " << source
+       << L" device=0x" << std::hex << reinterpret_cast<uintptr_t>(device);
+    LogLineNoLock(ss.str());
+
+    ID3D11DeviceContext* context = nullptr;
+    device->GetImmediateContext(&context);
+    if (context != nullptr)
+    {
+        InstallHooksForContextNoLock(context, source);
+        context->Release();
+    }
+
+    return ok;
+}
+
 bool InstallHooks()
 {
     D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
@@ -413,6 +476,7 @@ bool InstallHooks()
     }
 
     bool ok = InstallHooksForContextNoLock(context, L"dummy D3D11");
+    ok &= InstallHooksForDeviceNoLock(device, L"dummy D3D11");
 
     context->Release();
     device->Release();
@@ -1582,6 +1646,7 @@ void StoreUnityDeviceNoLock(void* device, int deviceType, int eventType)
 
     g_unityDevice = d3dDevice;
     LogLineNoLock(L"Unity D3D11 device stored");
+    InstallHooksForDeviceNoLock(g_unityDevice, L"UnitySetGraphicsDevice");
 }
 
 void TryInstallUnityContextHooksNoLock(const wchar_t* source)
@@ -1649,6 +1714,8 @@ bool StoreUnityDeviceFromTextureNoLock(void* nativeTexture)
             same << L"D3D11 device already stored from native texture size=" << desc.Width << L"x" << desc.Height
                  << L" format=" << FormatToString(desc.Format);
             LogLineNoLock(same.str());
+            InstallHooksForDeviceNoLock(g_unityDevice, L"native texture existing device");
+            TryInstallUnityContextHooksNoLock(L"native texture existing device");
             return true;
         }
 
@@ -1662,6 +1729,7 @@ bool StoreUnityDeviceFromTextureNoLock(void* nativeTexture)
        << L" format=" << FormatToString(desc.Format)
        << L" bindFlags=0x" << std::hex << desc.BindFlags;
     LogLineNoLock(ok.str());
+    InstallHooksForDeviceNoLock(g_unityDevice, L"native texture device");
     TryInstallUnityContextHooksNoLock(L"native texture device");
     return true;
 }
@@ -1678,6 +1746,8 @@ void STDMETHODCALLTYPE OnRenderEvent(int eventId)
 
         if (eventId != 2002 && eventId != 2003)
         {
+            if (g_unityDevice != nullptr)
+                InstallHooksForDeviceNoLock(g_unityDevice, L"Unity render event");
             TryInstallUnityContextHooksNoLock(L"Unity render event");
             return;
         }
@@ -1887,6 +1957,11 @@ extern "C" __declspec(dllexport) int ORS_BeginCapture(int width, int height, con
     g_pendingDepthRFloatPath.clear();
     g_lastDepthQueueResult = 0;
     g_captureActive = true;
+    if (g_unityDevice != nullptr)
+    {
+        InstallHooksForDeviceNoLock(g_unityDevice, L"capture begin");
+        TryInstallUnityContextHooksNoLock(L"capture begin");
+    }
 
     std::wstringstream ss;
     ss << L"capture begin: " << g_captureLabel << L" requestedSize=" << width << L"x" << height;

@@ -34,8 +34,7 @@ cmake --build Native\OfflineDepthD3D11Bridge\build --config Release
 ```
 
 The native DLL is not required for KKS. KK needs it for high quality
-off-screen device depth; the older Unity replacement-depth fallback is kept as
-diagnostic history, not as the main path.
+off-screen device depth; the release path is D3D11 bridge depth only.
 
 ## Settings
 
@@ -50,7 +49,7 @@ ConfigurationManager section: `Offline ReShade Export`
 - KK `D3D11 bridge DLL path`: optional explicit path to the native bridge.
 - KK `D3D11 bridge log path`: native bridge diagnostic log path.
 - KK `D3D11 bridge candidate diagnostics`: slow candidate sampling log for
-  debugging wrong/empty depth frames.
+  debugging wrong/empty depth frames. Keep it disabled for normal capture.
 
 ## Output Files
 
@@ -94,21 +93,6 @@ Current main format:
 - value: D3D/Unity device depth in `0..1`
 - reversed-Z flag: `metadata.reshadeDepthReversed`
 
-Earlier diagnostic formats may still exist in code paths:
-
-- `.rgba8`: raw packed RGBA8 device depth
-- `.png`: packed RGBA8 PNG device depth
-
-Packed RGBA8 stores:
-
-```text
-v = round(saturate(deviceDepth) * 4294967295)
-R = v & 0xFF
-G = (v >> 8) & 0xFF
-B = (v >> 16) & 0xFF
-A = (v >> 24) & 0xFF
-```
-
 `metadata.json` fields:
 
 - `width`, `height`: color output size
@@ -117,7 +101,7 @@ A = (v >> 24) & 0xFF
 - `downscalingRate`: ScreenshotManager supersampling rate
 - `colorResolve`: currently `screenshotmanager_lanczos`
 - `depthEncoding`, `depthFileExtension`, `depthByteOrder`, `depthRows`
-- `depthCaptureSource`: Unity hardware, KK D3D11 bridge, or fallback source
+- `depthCaptureSource`: Unity hardware depth on KKS or KK D3D11 bridge depth
 - `reshadeDepthReversed`, `reshadeDepthUpsideDown`, `reshadeFarPlane`
 
 ## Algorithm Notes
@@ -131,7 +115,17 @@ this off-screen render path. The native bridge hooks the Unity D3D11 immediate
 context during the `Camera.Render()` window, records depth-stencil views, checks
 readable non-MSAA candidates for nonzero content, copies the selected depth to
 an `R32_FLOAT` texture, then writes delayed staging readbacks to `.rfloat`.
-Empty candidates are not written; VideoExport can retry the same frame.
+Empty candidates are not written; the plugin logs a warning instead of saving
+fake depth.
+
+KK reliability notes:
+
+- Use a Studio camera/lens view for stable depth capture. Free-view screenshots
+  can miss the D3D11 depth pass in Unity 5.6.
+- Disable MSAA if depth is missing or the log reports MSAA/non-readable DSVs.
+- Disable Optimize in Background while testing user reports.
+- Candidate diagnostics are for troubleshooting only and should stay off for
+  normal recording.
 
 This bridge is archived here rather than in a separate repository because it is
 tightly coupled to ScreenshotManager's off-screen export timing and metadata.

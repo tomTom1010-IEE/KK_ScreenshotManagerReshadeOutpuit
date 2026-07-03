@@ -20,11 +20,10 @@ namespace Screencap
         private static ConfigEntry<bool> OfflineReShadeLogTimings { get; set; }
         private static ConfigEntry<OfflineDepthOutputFormat> OfflineReShadeDepthOutputFormat { get; set; }
 #if KK
-        private static ConfigEntry<KkDepthCaptureMode> OfflineReShadeKkDepthCaptureMode { get; set; }
-        private static ConfigEntry<string> OfflineReShadeKkPackedDepthBundlePath { get; set; }
         private static ConfigEntry<string> OfflineReShadeD3D11DepthBridgeDllPath { get; set; }
         private static ConfigEntry<string> OfflineReShadeD3D11DepthBridgeLogPath { get; set; }
         private static ConfigEntry<bool> OfflineReShadeD3D11CandidateDiagnosticsEnabled { get; set; }
+        private static bool _kkDepthMissingHintLogged;
 #endif
 
         /// <summary>
@@ -46,20 +45,9 @@ namespace Screencap
             PngRgba8
         }
 
-#if KK
-        private enum KkDepthCaptureMode
-        {
-            CustomReplacementPackedRgba8,
-            UnityDepthNormalsFallback,
-            ExperimentalHardwareDepth
-        }
-#endif
-
         private enum OfflineDepthTextureKind
         {
-            DeviceRFloat,
-            DevicePackedRgba8,
-            UnityDepthNormals
+            DeviceRFloat
         }
 
         private sealed class OfflineCaptureResult
@@ -73,67 +61,6 @@ namespace Screencap
         }
 
 #if KK
-        private static Material KkPackedDepthMaterial;
-        private static AssetBundle KkPackedDepthBundle;
-        private static Shader KkPackedDepthShader;
-        private const string KkPackedDepthShaderName = "Hidden/OfflineReShade/KKPackedDeviceDepth";
-        private const string KkPackedDepthBundleFileName = "OfflineReShadePackedDepth.unity3d";
-
-        private static readonly string KkPackedDeviceDepthShaderSource =
-            "Shader \"" + KkPackedDepthShaderName + "\"\n" +
-            "{\n" +
-            "    SubShader\n" +
-            "    {\n" +
-            "        Tags { \"RenderType\"=\"Opaque\" }\n" +
-            "        Pass\n" +
-            "        {\n" +
-            "            Cull Back\n" +
-            "            ZWrite On\n" +
-            "            ZTest LEqual\n" +
-            "\n" +
-            "            CGPROGRAM\n" +
-            "            #pragma vertex vert\n" +
-            "            #pragma fragment frag\n" +
-            "            #include \"UnityCG.cginc\"\n" +
-            "\n" +
-            "            struct v2f\n" +
-            "            {\n" +
-            "                float4 pos : SV_POSITION;\n" +
-            "                float depth : TEXCOORD0;\n" +
-            "            };\n" +
-            "\n" +
-            "            v2f vert(appdata_base v)\n" +
-            "            {\n" +
-            "                v2f o;\n" +
-            "                o.pos = UnityObjectToClipPos(v.vertex);\n" +
-            "                o.depth = o.pos.z / o.pos.w;\n" +
-            "                return o;\n" +
-            "            }\n" +
-            "\n" +
-            "            float4 PackDepthRgba8LE(float depth)\n" +
-            "            {\n" +
-            "                depth = saturate(depth);\n" +
-            "                float scaled = floor(depth * 4294967295.0 + 0.5);\n" +
-            "                float r = scaled - floor(scaled / 256.0) * 256.0;\n" +
-            "                scaled = floor(scaled / 256.0);\n" +
-            "                float g = scaled - floor(scaled / 256.0) * 256.0;\n" +
-            "                scaled = floor(scaled / 256.0);\n" +
-            "                float b = scaled - floor(scaled / 256.0) * 256.0;\n" +
-            "                scaled = floor(scaled / 256.0);\n" +
-            "                float a = scaled - floor(scaled / 256.0) * 256.0;\n" +
-            "                return float4(r, g, b, a) / 255.0;\n" +
-            "            }\n" +
-            "\n" +
-            "            fixed4 frag(v2f i) : SV_Target\n" +
-            "            {\n" +
-            "                return PackDepthRgba8LE(i.depth);\n" +
-            "            }\n" +
-            "            ENDCG\n" +
-            "        }\n" +
-            "    }\n" +
-            "    Fallback Off\n" +
-            "}";
-
         private static class D3D11DepthBridge
         {
             [UnmanagedFunctionPointer(CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
@@ -342,7 +269,7 @@ namespace Screencap
                 return !string.IsNullOrEmpty(pluginDir) ? Path.Combine(pluginDir, "OfflineDepthD3D11Bridge.dll") : "OfflineDepthD3D11Bridge.dll";
             }
 
-            private static string GetLastError()
+            public static string GetLastError()
             {
                 if (_getLastError == null)
                     return "unknown";
@@ -401,6 +328,17 @@ namespace Screencap
                 RenderTexture.ReleaseTemporary(rt);
             }
         }
+
+        private static void LogKkDepthMissingHint(string context)
+        {
+            var reason = D3D11DepthBridge.GetLastError();
+            Logger.LogWarning("Offline ReShade KK D3D11 depth was not written for " + context + ". Bridge reason: " + reason);
+            if (_kkDepthMissingHintLogged)
+                return;
+
+            _kkDepthMissingHintLogged = true;
+            Logger.LogWarning("Offline ReShade KK depth capture is most reliable from a Studio camera/lens view. If depth is missing, switch from free view to a camera view, disable MSAA, and disable Optimize in Background before retrying.");
+        }
 #endif
 
         /// <summary>
@@ -431,7 +369,7 @@ namespace Screencap
                 "Offline ReShade Export",
                 "Archive color/depth in screenshot directory",
                 true,
-                "Also saves timestamped Color and Depth PNG files to the normal screenshot directory for offline use.");
+                "Also saves timestamped Color and Depth sidecar files to the normal screenshot directory for offline use.");
 
             OfflineReShadeLogTimings = Config.Bind(
                 "Offline ReShade Export",
@@ -525,6 +463,10 @@ namespace Screencap
                 {
                     File.Copy(depthPath, archiveDepthPath, true);
                 }
+                else if (!File.Exists(depthPath))
+                {
+                    LogKkDepthMissingHint("Ctrl+F10");
+                }
 #endif
 
                 WriteOfflineMetadata(metadataPath, width, height, capture.DepthWidth, capture.DepthHeight, Camera.main, capture.DepthSource, downscaling);
@@ -609,20 +551,22 @@ namespace Screencap
                 var renderSw = Stopwatch.StartNew();
 #if KK
                 var d3d11ProbeActive = D3D11DepthBridge.TryBegin(renderWidth, renderHeight, timingLabel);
-                if (!d3d11ProbeActive)
-                    throw new InvalidOperationException("D3D11 depth bridge failed to begin capture.");
                 try
                 {
-                    D3D11DepthBridge.SetUnityD3D11Texture(colorRt);
-                    D3D11DepthBridge.IssueRenderThreadHookEvent();
-                    ForceD3D11DepthBridgeProbeFlush(colorRt, timingLabel, "D3D11 render-thread hook flush");
+                    if (d3d11ProbeActive)
+                    {
+                        D3D11DepthBridge.SetUnityD3D11Texture(colorRt);
+                        D3D11DepthBridge.IssueRenderThreadHookEvent();
+                        ForceD3D11DepthBridgeProbeFlush(colorRt, timingLabel, "D3D11 render-thread hook flush");
+                    }
                     cam.Render();
-                    if (!string.IsNullOrEmpty(d3d11DepthRFloatPath))
+                    if (d3d11ProbeActive && !string.IsNullOrEmpty(d3d11DepthRFloatPath))
                         D3D11DepthBridge.IssueDepthRFloatReadbackEvent(d3d11DepthRFloatPath);
                 }
                 finally
                 {
-                    D3D11DepthBridge.End();
+                    if (d3d11ProbeActive)
+                        D3D11DepthBridge.End();
                 }
 #else
                 cam.Render();
@@ -635,9 +579,6 @@ namespace Screencap
 #else
                 Texture2D depthTex;
                 ReadDepthTexture(depthRt, width, height, depthKind, out depthTex, timingLabel, "depth ReadPixels+Apply");
-#endif
-
-#if KK
 #endif
 
                 if (safeDownscaling > 1)
@@ -736,7 +677,10 @@ namespace Screencap
                         queueResult = D3D11DepthBridge.GetLastDepthQueueResult();
                     }
 
-                    return queueResult > 0 || File.Exists(depthPath);
+                    var hasDepthFile = queueResult > 0 || File.Exists(depthPath);
+                    if (!hasDepthFile)
+                        LogKkDepthMissingHint(frameLabel);
+                    return hasDepthFile;
                 }
 #endif
                 return capture.Depth != null || File.Exists(depthPath);
@@ -798,33 +742,13 @@ namespace Screencap
 
         private static string GetDepthTextureName(OfflineDepthTextureKind depthKind)
         {
-            switch (depthKind)
-            {
-                case OfflineDepthTextureKind.DeviceRFloat:
-                    return "OfflineReShade_DeviceDepth_RFloat";
-                case OfflineDepthTextureKind.DevicePackedRgba8:
-                    return "OfflineReShade_DeviceDepth_PackedRGBA8";
-                case OfflineDepthTextureKind.UnityDepthNormals:
-                    return "OfflineReShade_DepthNormalsFallback";
-                default:
-                    return "OfflineReShade_Depth";
-            }
+            return "OfflineReShade_DeviceDepth_RFloat";
         }
 
         private static string GetDepthCaptureSource(int safeDownscaling, OfflineDepthTextureKind depthKind)
         {
 #if KK
-            switch (depthKind)
-            {
-                case OfflineDepthTextureKind.DevicePackedRgba8:
-                    return "custom_replacement_packed_rgba8_device_depth_x" + safeDownscaling;
-                case OfflineDepthTextureKind.UnityDepthNormals:
-                    return "unity_internal_depthnormals_replacement_x" + safeDownscaling;
-                case OfflineDepthTextureKind.DeviceRFloat:
-                    return "d3d11_depth_stencil_bridge_x" + safeDownscaling;
-                default:
-                    return "unknown_depth_source_x" + safeDownscaling;
-            }
+            return "d3d11_depth_stencil_bridge_x" + safeDownscaling;
 #else
             return "camera_depth_texture_after_everything_gpu_downscaled_x" + safeDownscaling;
 #endif
@@ -841,276 +765,6 @@ namespace Screencap
             depthReadSw.Stop();
             LogOfflineTiming(timingLabel, timingStep, depthReadSw.Elapsed);
         }
-
-#if KK
-        private static string[] GetKkPackedDepthBundleCandidates()
-        {
-            var pluginDir = Path.GetDirectoryName(typeof(ScreenshotManager).Assembly.Location);
-            return new[]
-            {
-                OfflineReShadeKkPackedDepthBundlePath != null ? OfflineReShadeKkPackedDepthBundlePath.Value : null,
-                !string.IsNullOrEmpty(pluginDir) ? Path.Combine(pluginDir, KkPackedDepthBundleFileName) : null,
-                !string.IsNullOrEmpty(pluginDir) ? Path.Combine(pluginDir, KkPackedDepthBundleFileName.ToLowerInvariant()) : null,
-                !string.IsNullOrEmpty(pluginDir) ? Path.Combine(Path.Combine(Path.Combine(pluginDir, "hidden"), "offlinereshade"), KkPackedDepthBundleFileName.ToLowerInvariant()) : null,
-                !string.IsNullOrEmpty(pluginDir) ? Path.Combine(Path.Combine(Path.Combine(pluginDir, "Hidden"), "OfflineReShade"), KkPackedDepthBundleFileName) : null
-            };
-        }
-
-        private static Shader FindKkDepthShaderInBundle(AssetBundle bundle, string shaderName)
-        {
-            if (bundle == null)
-                return null;
-
-            var shaders = bundle.LoadAllAssets(typeof(Shader));
-            for (var i = 0; i < shaders.Length; i++)
-            {
-                var shader = shaders[i] as Shader;
-                if (shader != null && shader.name == shaderName)
-                    return shader;
-            }
-
-            var materials = bundle.LoadAllAssets(typeof(Material));
-            for (var i = 0; i < materials.Length; i++)
-            {
-                var material = materials[i] as Material;
-                if (material != null && material.shader != null && material.shader.name == shaderName)
-                    return material.shader;
-            }
-
-            var prefabs = bundle.LoadAllAssets(typeof(GameObject));
-            for (var i = 0; i < prefabs.Length; i++)
-            {
-                var go = prefabs[i] as GameObject;
-                if (go == null)
-                    continue;
-
-                var renderers = go.GetComponentsInChildren<Renderer>(true);
-                for (var r = 0; r < renderers.Length; r++)
-                {
-                    var renderer = renderers[r];
-                    if (renderer == null || renderer.sharedMaterials == null)
-                        continue;
-
-                    var rendererMaterials = renderer.sharedMaterials;
-                    for (var m = 0; m < rendererMaterials.Length; m++)
-                    {
-                        var material = rendererMaterials[m];
-                        if (material != null && material.shader != null && material.shader.name == shaderName)
-                            return material.shader;
-                    }
-                }
-            }
-
-            return null;
-        }
-
-        private static void UnloadKkDepthBundleIfUnused()
-        {
-            if (KkPackedDepthShader != null || KkPackedDepthBundle == null)
-                return;
-
-            KkPackedDepthBundle.Unload(false);
-            KkPackedDepthBundle = null;
-        }
-
-        private static bool TryLoadKkDepthShaderFromBundle(string shaderName, ref Shader cachedShader, string label, out Shader shader)
-        {
-            shader = cachedShader;
-            if (shader != null && shader.isSupported)
-                return true;
-
-            var candidates = GetKkPackedDepthBundleCandidates();
-            for (var i = 0; i < candidates.Length; i++)
-            {
-                var path = candidates[i];
-                if (string.IsNullOrEmpty(path))
-                    continue;
-
-                path = Path.GetFullPath(path);
-                if (!File.Exists(path))
-                    continue;
-
-                try
-                {
-                    if (KkPackedDepthBundle == null)
-                        KkPackedDepthBundle = AssetBundle.LoadFromFile(path);
-
-                    shader = FindKkDepthShaderInBundle(KkPackedDepthBundle, shaderName);
-                    if (shader != null && shader.isSupported)
-                    {
-                        cachedShader = shader;
-                        Logger.LogInfo("Offline ReShade: loaded KK " + label + " depth shader bundle from " + path);
-                        return true;
-                    }
-
-                    Logger.LogWarning("Offline ReShade KK depth bundle did not contain supported shader " + shaderName + ": " + path);
-                    UnloadKkDepthBundleIfUnused();
-                }
-                catch (Exception ex)
-                {
-                    Logger.LogWarning("Offline ReShade KK depth bundle failed to load from " + path + ": " + ex.Message);
-                    if (KkPackedDepthBundle != null)
-                    {
-                        KkPackedDepthBundle.Unload(false);
-                        KkPackedDepthBundle = null;
-                    }
-                }
-            }
-
-            return false;
-        }
-
-        private static bool TryLoadKkPackedDepthShaderFromBundle(out Shader shader)
-        {
-            return TryLoadKkDepthShaderFromBundle(KkPackedDepthShaderName, ref KkPackedDepthShader, "packed RGBA8", out shader);
-        }
-
-        private static bool TryGetKkPackedDepthShader(out Shader shader)
-        {
-            shader = null;
-
-            if (TryLoadKkPackedDepthShaderFromBundle(out shader))
-                return true;
-
-            try
-            {
-                if (KkPackedDepthMaterial == null)
-                {
-                    KkPackedDepthMaterial = new Material(KkPackedDeviceDepthShaderSource);
-                    KkPackedDepthMaterial.hideFlags = HideFlags.HideAndDontSave;
-                }
-
-                shader = KkPackedDepthMaterial.shader;
-                if (shader == null || !shader.isSupported)
-                {
-                    Logger.LogWarning("Offline ReShade KK custom packed RGBA8 depth shader is not supported.");
-                    return false;
-                }
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                Logger.LogWarning("Offline ReShade KK custom packed RGBA8 depth shader could not be created: " + ex.Message);
-                return false;
-            }
-        }
-
-        private static bool RenderKkCustomPackedDepth(Camera cam, RenderTexture depthRt, int width, int height)
-        {
-            Shader packedDepthShader;
-            if (!TryGetKkPackedDepthShader(out packedDepthShader))
-                return false;
-
-            var oldTarget = cam.targetTexture;
-            var oldRect = cam.rect;
-            var oldActive = RenderTexture.active;
-            var oldClearFlags = cam.clearFlags;
-            var oldBackground = cam.backgroundColor;
-            var farDepthColor = SystemInfo.usesReversedZBuffer ? Color.clear : Color.white;
-
-            try
-            {
-                cam.targetTexture = depthRt;
-                cam.rect = new Rect(0, 0, 1, 1);
-                cam.clearFlags = CameraClearFlags.SolidColor;
-                cam.backgroundColor = farDepthColor;
-                RenderTexture.active = depthRt;
-                GL.Clear(true, true, farDepthColor);
-                cam.RenderWithShader(packedDepthShader, "");
-                Logger.LogInfo("Offline ReShade: Custom replacement packed RGBA8 depth rendered.");
-                return true;
-            }
-            finally
-            {
-                cam.targetTexture = oldTarget;
-                cam.rect = oldRect;
-                cam.clearFlags = oldClearFlags;
-                cam.backgroundColor = oldBackground;
-                RenderTexture.active = oldActive;
-            }
-        }
-
-        private static bool IsKkHardwareDepthValid(Texture2D depthTex, string timingLabel)
-        {
-            if (depthTex == null || depthTex.format != TextureFormat.RFloat)
-                return false;
-
-            var rawSw = Stopwatch.StartNew();
-            var raw = depthTex.GetRawTextureData();
-            rawSw.Stop();
-            LogOfflineTiming(timingLabel, "KK hardware depth validation GetRawTextureData", rawSw.Elapsed);
-
-            if (raw == null || raw.Length != depthTex.width * depthTex.height * sizeof(float))
-                return false;
-
-            var values = new float[depthTex.width * depthTex.height];
-            Buffer.BlockCopy(raw, 0, values, 0, raw.Length);
-
-            var valid = 0;
-            var invalid = 0;
-            var min = float.PositiveInfinity;
-            var max = float.NegativeInfinity;
-            var sum = 0.0;
-
-            for (var i = 0; i < values.Length; i++)
-            {
-                var d = values[i];
-                if (float.IsNaN(d) || float.IsInfinity(d) || d < -0.0001f || d > 1.0001f)
-                {
-                    invalid++;
-                    continue;
-                }
-
-                valid++;
-                if (d < min) min = d;
-                if (d > max) max = d;
-                sum += d;
-            }
-
-            var validRatio = values.Length > 0 ? (double)valid / values.Length : 0.0;
-            var mean = valid > 0 ? sum / valid : 0.0;
-            Logger.LogInfo($"[OfflineReShadeTiming] {timingLabel}: KK hardware depth stats valid={validRatio:P1}, invalid={invalid}, min={min:0.000000}, max={max:0.000000}, mean={mean:0.000000}");
-
-            return validRatio > 0.95 && max - min > 0.000001f;
-        }
-
-        private static bool RenderKkDepthNormalsFallback(Camera cam, RenderTexture depthRt, int width, int height)
-        {
-            var depthNormalsShader = Shader.Find("Hidden/Internal-DepthNormalsTexture");
-            if (depthNormalsShader == null)
-            {
-                Logger.LogWarning("Offline ReShade KK depth export failed: Hidden/Internal-DepthNormalsTexture shader was not found.");
-                return false;
-            }
-
-            var oldTarget = cam.targetTexture;
-            var oldRect = cam.rect;
-            var oldActive = RenderTexture.active;
-            var oldClearFlags = cam.clearFlags;
-            var oldBackground = cam.backgroundColor;
-
-            try
-            {
-                cam.targetTexture = depthRt;
-                cam.rect = new Rect(0, 0, 1, 1);
-                cam.clearFlags = CameraClearFlags.SolidColor;
-                cam.backgroundColor = Color.white;
-                RenderTexture.active = depthRt;
-                GL.Clear(true, true, Color.white);
-                cam.RenderWithShader(depthNormalsShader, "RenderType");
-                return true;
-            }
-            finally
-            {
-                cam.targetTexture = oldTarget;
-                cam.rect = oldRect;
-                cam.clearFlags = oldClearFlags;
-                cam.backgroundColor = oldBackground;
-                RenderTexture.active = oldActive;
-            }
-        }
-#endif
 
         private static string GetOfflineArchiveFilename(string capType, DateTime timestamp)
         {
@@ -1149,29 +803,6 @@ namespace Screencap
             }
 
             return Path.GetFullPath(Path.Combine(ScreenshotDir, filename));
-        }
-
-        private static Texture2D DownscaleDepthNearest(Texture2D source, int width, int height)
-        {
-            var src = source.GetPixels();
-            var dst = new Color[width * height];
-            var srcWidth = source.width;
-            var srcHeight = source.height;
-
-            for (var y = 0; y < height; y++)
-            {
-                var srcY = Mathf.Clamp(Mathf.RoundToInt((y + 0.5f) * srcHeight / height - 0.5f), 0, srcHeight - 1);
-                for (var x = 0; x < width; x++)
-                {
-                    var srcX = Mathf.Clamp(Mathf.RoundToInt((x + 0.5f) * srcWidth / width - 0.5f), 0, srcWidth - 1);
-                    dst[y * width + x] = src[srcY * srcWidth + srcX];
-                }
-            }
-
-            var result = new Texture2D(width, height, TextureFormat.RFloat, false, true);
-            result.SetPixels(dst);
-            result.Apply(false, false);
-            return result;
         }
 
         private static IEnumerator WriteRenderTexturePng(RenderTexture result, string filename, string timingLabel = null)
@@ -1231,20 +862,10 @@ namespace Screencap
 
         private static void WriteRawDepthRFloat(Texture2D deviceDepthTexture, string filename, Camera cam, OfflineDepthTextureKind depthKind, string timingLabel = null)
         {
-            byte[] raw;
-            if (depthKind == OfflineDepthTextureKind.DeviceRFloat)
-            {
-                var rawSw = Stopwatch.StartNew();
-                raw = deviceDepthTexture.GetRawTextureData();
-                rawSw.Stop();
-                LogOfflineTiming(timingLabel, "depth GetRawTextureData", rawSw.Elapsed);
-            }
-            else
-            {
-                var values = GetDeviceDepthValues(deviceDepthTexture, cam, depthKind, timingLabel);
-                raw = new byte[values.Length * sizeof(float)];
-                Buffer.BlockCopy(values, 0, raw, 0, raw.Length);
-            }
+            var rawSw = Stopwatch.StartNew();
+            var raw = deviceDepthTexture.GetRawTextureData();
+            rawSw.Stop();
+            LogOfflineTiming(timingLabel, "depth GetRawTextureData", rawSw.Elapsed);
 
             var writeSw = Stopwatch.StartNew();
             File.WriteAllBytes(filename, raw);
@@ -1262,44 +883,6 @@ namespace Screencap
             LogOfflineTiming(timingLabel, "depth raw rgba8 file write", writeSw.Elapsed);
         }
 
-#if KK
-        private static float DecodeUnityDepthNormalsDepth(Color32 pixel)
-        {
-            // UnityCG EncodeDepthNormal stores depth in BA through EncodeFloatRG.
-            return Mathf.Clamp01((pixel.b / 255f) + (pixel.a / 255f) / 255f);
-        }
-
-        private static float DecodeUnityDepthNormalsDeviceDepth(Color32 pixel, Camera cam)
-        {
-            var linear01 = DecodeUnityDepthNormalsDepth(pixel);
-            var far = cam != null ? Mathf.Max(cam.farClipPlane, 0.001f) : 1000f;
-            var near = cam != null ? Mathf.Max(cam.nearClipPlane, 0.001f) : 0.001f;
-            if (far <= near)
-                far = near + 0.001f;
-
-            var eyeDepth = Mathf.Clamp(linear01 * far, near, far);
-            var range = far - near;
-            var deviceDepth = SystemInfo.usesReversedZBuffer
-                ? near * (far / eyeDepth - 1f) / range
-                : far / range - (far * near) / (range * eyeDepth);
-
-            if (float.IsNaN(deviceDepth) || float.IsInfinity(deviceDepth))
-                return SystemInfo.usesReversedZBuffer ? 0f : 1f;
-
-            return Mathf.Clamp01(deviceDepth);
-        }
-#endif
-
-        private static float DecodePackedRgba8DeviceDepth(Color32 pixel)
-        {
-            var value =
-                (uint)pixel.r |
-                ((uint)pixel.g << 8) |
-                ((uint)pixel.b << 16) |
-                ((uint)pixel.a << 24);
-            return value / (float)uint.MaxValue;
-        }
-
         private static Color32 PackDeviceDepthToRgba8(float depth)
         {
             if (float.IsNaN(depth) || float.IsInfinity(depth))
@@ -1315,54 +898,18 @@ namespace Screencap
 
         private static float[] GetDeviceDepthValues(Texture2D depthTexture, Camera cam, OfflineDepthTextureKind depthKind, string timingLabel)
         {
-            if (depthKind == OfflineDepthTextureKind.DeviceRFloat)
-            {
-                var rawSw = Stopwatch.StartNew();
-                var raw = depthTexture.GetRawTextureData();
-                rawSw.Stop();
-                LogOfflineTiming(timingLabel, "depth GetRawTextureData", rawSw.Elapsed);
+            var rawSw = Stopwatch.StartNew();
+            var raw = depthTexture.GetRawTextureData();
+            rawSw.Stop();
+            LogOfflineTiming(timingLabel, "depth GetRawTextureData", rawSw.Elapsed);
 
-                var values = new float[depthTexture.width * depthTexture.height];
-                Buffer.BlockCopy(raw, 0, values, 0, Math.Min(raw.Length, values.Length * sizeof(float)));
-                return values;
-            }
-
-            var getSw = Stopwatch.StartNew();
-            var pixels32 = depthTexture.GetPixels32();
-            getSw.Stop();
-            LogOfflineTiming(timingLabel, depthKind == OfflineDepthTextureKind.DevicePackedRgba8 ? "depth GetPixels32 packed RGBA8" : "depth GetPixels32 depthnormals", getSw.Elapsed);
-
-            var packSw = Stopwatch.StartNew();
-            var decoded = new float[pixels32.Length];
-            for (var i = 0; i < pixels32.Length; i++)
-            {
-                if (depthKind == OfflineDepthTextureKind.DevicePackedRgba8)
-                    decoded[i] = DecodePackedRgba8DeviceDepth(pixels32[i]);
-                else
-                {
-#if KK
-                    decoded[i] = DecodeUnityDepthNormalsDeviceDepth(pixels32[i], cam);
-#else
-                    decoded[i] = 0f;
-#endif
-                }
-            }
-            packSw.Stop();
-            LogOfflineTiming(timingLabel, depthKind == OfflineDepthTextureKind.DevicePackedRgba8 ? "depth decode packed RGBA8 to rfloat" : "depth decode depthnormals to rfloat", packSw.Elapsed);
-            return decoded;
+            var values = new float[depthTexture.width * depthTexture.height];
+            Buffer.BlockCopy(raw, 0, values, 0, Math.Min(raw.Length, values.Length * sizeof(float)));
+            return values;
         }
 
         private static byte[] GetPackedRgba8DepthBytes(Texture2D depthTexture, Camera cam, OfflineDepthTextureKind depthKind, string timingLabel)
         {
-            if (depthKind == OfflineDepthTextureKind.DevicePackedRgba8)
-            {
-                var rawSw = Stopwatch.StartNew();
-                var raw = depthTexture.GetRawTextureData();
-                rawSw.Stop();
-                LogOfflineTiming(timingLabel, "depth GetRawTextureData packed RGBA8", rawSw.Elapsed);
-                return raw;
-            }
-
             var values = GetDeviceDepthValues(depthTexture, cam, depthKind, timingLabel);
             var packSw = Stopwatch.StartNew();
             var rawBytes = new byte[values.Length * 4];

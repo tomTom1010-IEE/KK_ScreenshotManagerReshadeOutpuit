@@ -24,6 +24,7 @@ namespace Screencap
         private static ConfigEntry<string> OfflineReShadeD3D11DepthBridgeLogPath { get; set; }
         private static ConfigEntry<bool> OfflineReShadeD3D11CandidateDiagnosticsEnabled { get; set; }
         private static ConfigEntry<bool> OfflineReShadeKkEnvironmentFingerprintEnabled { get; set; }
+        private static ConfigEntry<bool> OfflineReShadeKkCameraStackRenderEnabled { get; set; }
         private static bool _kkDepthMissingHintLogged;
 #endif
 
@@ -468,6 +469,135 @@ namespace Screencap
             }
         }
 
+        private sealed class KkCameraState
+        {
+            public Camera Camera;
+            public RenderTexture TargetTexture;
+            public Rect Rect;
+            public DepthTextureMode DepthTextureMode;
+        }
+
+        private static void AppendKkBridgeLogLine(string line)
+        {
+            Logger.LogInfo(line);
+            try
+            {
+                var logPath = OfflineReShadeD3D11DepthBridgeLogPath != null ? Path.GetFullPath(OfflineReShadeD3D11DepthBridgeLogPath.Value) : null;
+                if (!string.IsNullOrEmpty(logPath))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+                    File.AppendAllText(logPath, line + Environment.NewLine, Encoding.UTF8);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("Offline ReShade KK bridge log append failed: " + ex.Message);
+            }
+        }
+
+        private static bool IsKkStackCamera(Camera root, Camera candidate)
+        {
+            if (root == null || candidate == null || !candidate.enabled || !candidate.gameObject.activeInHierarchy)
+                return false;
+            if (candidate == root)
+                return true;
+            return candidate.transform != null && root.transform != null && candidate.transform.IsChildOf(root.transform);
+        }
+
+        private static Camera[] GetKkOfflineCameraStack(Camera root)
+        {
+            var cameras = Camera.allCameras;
+            if (cameras == null || cameras.Length == 0)
+                return new[] { root };
+
+            var stack = new System.Collections.Generic.List<Camera>();
+            for (var i = 0; i < cameras.Length; i++)
+            {
+                var candidate = cameras[i];
+                if (IsKkStackCamera(root, candidate) && !stack.Contains(candidate))
+                    stack.Add(candidate);
+            }
+
+            if (!stack.Contains(root))
+                stack.Add(root);
+
+            stack.Sort((a, b) =>
+            {
+                var depthCompare = a.depth.CompareTo(b.depth);
+                if (depthCompare != 0)
+                    return depthCompare;
+                return string.Compare(GetTransformPath(a.transform), GetTransformPath(b.transform), StringComparison.Ordinal);
+            });
+            return stack.ToArray();
+        }
+
+        private static KkCameraState[] ApplyKkCameraStackTarget(Camera[] stack, RenderTexture target)
+        {
+            var states = new KkCameraState[stack.Length];
+            for (var i = 0; i < stack.Length; i++)
+            {
+                var camera = stack[i];
+                states[i] = new KkCameraState
+                {
+                    Camera = camera,
+                    TargetTexture = camera.targetTexture,
+                    Rect = camera.rect,
+                    DepthTextureMode = camera.depthTextureMode
+                };
+                camera.targetTexture = target;
+                camera.rect = new Rect(0, 0, 1, 1);
+                camera.depthTextureMode |= DepthTextureMode.Depth;
+            }
+            return states;
+        }
+
+        private static void RestoreKkCameraStackTarget(KkCameraState[] states)
+        {
+            if (states == null)
+                return;
+
+            for (var i = 0; i < states.Length; i++)
+            {
+                var state = states[i];
+                if (state == null || state.Camera == null)
+                    continue;
+
+                state.Camera.targetTexture = state.TargetTexture;
+                state.Camera.rect = state.Rect;
+                state.Camera.depthTextureMode = state.DepthTextureMode;
+            }
+        }
+
+        private static void RenderKkCameraStack(Camera root, RenderTexture target, string timingLabel)
+        {
+            var useStack = OfflineReShadeKkCameraStackRenderEnabled == null || OfflineReShadeKkCameraStackRenderEnabled.Value;
+            var stack = useStack ? GetKkOfflineCameraStack(root) : new[] { root };
+            KkCameraState[] states = null;
+            try
+            {
+                states = ApplyKkCameraStackTarget(stack, target);
+                AppendKkBridgeLogLine("[OfflineReShadeCameraStack] begin context=" + timingLabel + " count=" + stack.Length + " mode=" + (useStack ? "stack" : "main-only"));
+                for (var i = 0; i < stack.Length; i++)
+                {
+                    var camera = stack[i];
+                    AppendKkBridgeLogLine("[OfflineReShadeCameraStack] render index=" + i +
+                        " name=" + camera.name +
+                        " path=" + GetTransformPath(camera.transform) +
+                        " depth=" + camera.depth.ToString(CultureInfo.InvariantCulture) +
+                        " clearFlags=" + camera.clearFlags +
+                        " cullingMask=0x" + camera.cullingMask.ToString("X8", CultureInfo.InvariantCulture) +
+                        " actualRenderingPath=" + camera.actualRenderingPath +
+                        " depthTextureMode=" + camera.depthTextureMode);
+                    camera.Render();
+                }
+                AppendKkBridgeLogLine("[OfflineReShadeCameraStack] end context=" + timingLabel);
+            }
+            finally
+            {
+                RestoreKkCameraStackTarget(states);
+            }
+        }
+
         private static void LogKkDepthMissingHint(string context)
         {
             var reason = D3D11DepthBridge.GetLastError();
@@ -548,6 +678,12 @@ namespace Screencap
                 "KK environment fingerprint log",
                 true,
                 "Writes a KK-only environment/camera/settings fingerprint to the game log and D3D11 bridge log for comparing machines with unstable depth capture.");
+
+            OfflineReShadeKkCameraStackRenderEnabled = Config.Bind(
+                "Offline ReShade Export",
+                "KK camera stack render test",
+                true,
+                "Test build option: render Camera.main and enabled child cameras to the offline target in camera.depth order so Studio camera stacks can write depth.");
 #endif
         }
 
@@ -692,8 +828,10 @@ namespace Screencap
                 cam.depthTextureMode |= DepthTextureMode.Depth;
                 if (depthCopy != null)
                     cam.AddCommandBuffer(CameraEvent.AfterEverything, depthCopy);
+#if !KK
                 cam.targetTexture = colorRt;
                 cam.rect = new Rect(0, 0, 1, 1);
+#endif
 
                 RenderTexture.active = colorRt;
                 GL.Clear(true, true, Color.clear);
@@ -708,7 +846,7 @@ namespace Screencap
                         D3D11DepthBridge.IssueRenderThreadHookEvent();
                         ForceD3D11DepthBridgeProbeFlush(colorRt, timingLabel, "D3D11 render-thread hook flush");
                     }
-                    cam.Render();
+                    RenderKkCameraStack(cam, colorRt, timingLabel);
                     if (d3d11ProbeActive && !string.IsNullOrEmpty(d3d11DepthRFloatPath))
                         D3D11DepthBridge.IssueDepthRFloatReadbackEvent(d3d11DepthRFloatPath);
                 }

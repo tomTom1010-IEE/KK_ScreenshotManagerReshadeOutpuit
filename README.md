@@ -34,8 +34,42 @@ cmake --build Native\OfflineDepthD3D11Bridge\build --config Release
 ```
 
 The native DLL is not required for KKS. KK needs it for high quality
-off-screen device depth; the release path is D3D11 bridge depth only.
+off-screen device depth.
 
+## Release Variants
+
+This project is published as three practical packages:
+
+- **KKS Screencap**: `KKS_Screencap.dll` only. KKS uses Unity 2019.4 camera
+  depth texture export and does not need the native D3D11 bridge.
+- **KK Stable Path**: `Screencap.dll` + `OfflineDepthD3D11Bridge.dll` built
+  from the lighter `main` release path. Use this first on KK installs where
+  depth output is already stable and aligned.
+- **KK Compatibility Bridge**: `Screencap.dll` + `OfflineDepthD3D11Bridge.dll`
+  built from the rehook compatibility path. Use this if the stable package
+  loses depth after restart, only captures the first frame, or VideoExport
+  intermittently misses depth frames.
+
+Both KK packages export the same `.rfloat` format and metadata schema. The
+compatibility package repeatedly verifies and repairs D3D11 context hooks across
+captures, which improves reliability on troublesome Unity 5.6/plugin stacks.
+
+## Performance Notes
+
+Normal capture should keep `D3D11 bridge candidate diagnostics` disabled. The
+candidate diagnostics mode is for support logs only and adds measurable overhead.
+
+In same-KK testing, the compatibility bridge is within roughly 10% of the
+lighter stable path. This is the expected release tradeoff: if a KK environment
+cannot use the stable path reliably, the compatibility package gives stable
+color/depth output with a small performance cost. Most remaining frame time is
+spent in color readback and PNG encoding rather than the D3D11 depth bridge.
+
+Do not use unrelated KK/KKS scenes to calculate exact performance deltas. Scene
+complexity, texture size, ScreenshotManager supersampling, MSAA, and whether the
+depth sidecar is written at `3840x2160` or `7680x4320` can dominate the result.
+KKS performance numbers are useful as a sanity check, not as a strict comparison
+against KK.
 ## Settings
 
 ConfigurationManager section: `Offline ReShade Export`

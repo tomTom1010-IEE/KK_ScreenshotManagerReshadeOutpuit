@@ -1035,10 +1035,14 @@ const DsvStats* SelectBestReadableDepthValidatedNoLock()
                 continue;
             sampledAnyCandidate = true;
 
+            const bool fresh = candidate->drawCount > 0 || candidate->clearCount > 0;
             std::wstringstream line;
             line << L"D3D11 candidate validation dsv=0x" << std::hex << candidate->dsv << std::dec
                  << L" score=" << ScoreCandidate(*candidate)
                  << L" size=" << candidate->width << L"x" << candidate->height
+                 << L" fresh=" << (fresh ? L"true" : L"false")
+                 << L" clears=" << candidate->clearCount
+                 << L" draws=" << candidate->drawCount
                  << L" nonZero=" << stats.nonZero
                  << L" min=" << stats.minValue
                  << L" max=" << stats.maxValue
@@ -1047,6 +1051,17 @@ const DsvStats* SelectBestReadableDepthValidatedNoLock()
 
             if (stats.nonZero == 0)
                 continue;
+
+            if (!fresh)
+            {
+                std::wstringstream stale;
+                stale << L"D3D11 candidate validation rejected stale nonzero candidate dsv=0x"
+                      << std::hex << candidate->dsv << std::dec
+                      << L" reason=stale_nonzero_no_draw_or_clear"
+                      << L" nonZero=" << stats.nonZero;
+                LogLineNoLock(stale.str());
+                continue;
+            }
 
             const bool exactSize = static_cast<int>(candidate->width) == g_captureWidth &&
                 static_cast<int>(candidate->height) == g_captureHeight;
@@ -1096,7 +1111,7 @@ const DsvStats* SelectBestReadableDepthValidatedNoLock()
     if (bestAnyNonZero != nullptr)
     {
         std::wstringstream ss;
-        ss << L"D3D11 depth candidate validation found nonzero candidates, but none matched requested size "
+        ss << L"D3D11 depth candidate validation found fresh nonzero candidates, but none matched requested size "
            << g_captureWidth << L"x" << g_captureHeight
            << L"; bestNonExact dsv=0x" << std::hex << bestAnyNonZero->dsv << std::dec
            << L" size=" << bestAnyNonZero->width << L"x" << bestAnyNonZero->height
@@ -1106,7 +1121,7 @@ const DsvStats* SelectBestReadableDepthValidatedNoLock()
         return nullptr;
     }
 
-    SetLastErrorText(L"D3D11 depth candidate validation found only empty readable candidates");
+    SetLastErrorText(L"D3D11 depth candidate validation found only empty or stale readable candidates");
     LogLineNoLock(g_lastError);
     return nullptr;
 }

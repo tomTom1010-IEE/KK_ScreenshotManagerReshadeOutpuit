@@ -1,4 +1,4 @@
-﻿using alphaShot;
+using alphaShot;
 using BepInEx.Configuration;
 using System;
 using System.Collections;
@@ -810,6 +810,9 @@ namespace Screencap
 
             try
             {
+#if KK
+                DeleteStaleOfflineDepthFile(depthPath, "Ctrl+F10 depthoutput pre-clean");
+#endif
                 capture = CaptureColorAndHardwareDepth(width, height, downscaling, "Ctrl+F10", depthPath);
                 if (capture == null || capture.Color == null)
                     yield break;
@@ -863,6 +866,25 @@ namespace Screencap
                 FirePostCapture();
             }
         }
+
+#if KK
+        private static void DeleteStaleOfflineDepthFile(string depthPath, string timingLabel)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(depthPath) && File.Exists(depthPath))
+                {
+                    File.Delete(depthPath);
+                    Logger.LogInfo("Offline ReShade KK removed stale depth sidecar before capture: " + depthPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("Offline ReShade KK failed to remove stale depth sidecar for " + timingLabel + ": " + ex.Message);
+            }
+        }
+
+#endif
 
         private static OfflineCaptureResult CaptureColorAndHardwareDepth(int width, int height, int downscalingRate, string timingLabel = null, string d3d11DepthRFloatPath = null)
         {
@@ -1031,6 +1053,9 @@ namespace Screencap
 
             try
             {
+#if KK
+                DeleteStaleOfflineDepthFile(depthPath, frameLabel + " depth pre-clean");
+#endif
                 capture = CaptureColorAndHardwareDepth(captureWidth, captureHeight, captureDownscaling, frameLabel, depthPath);
                 if (capture == null || capture.Color == null)
                     return false;

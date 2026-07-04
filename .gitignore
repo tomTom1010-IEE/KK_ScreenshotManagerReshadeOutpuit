@@ -11,6 +11,7 @@
 !/Directory.Build.props
 !/nuget.config
 !/README.md
+!/README.zh-CN.md
 !/LICENSE
 !/release.ps1
 !/Native/

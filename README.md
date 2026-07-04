@@ -1,3 +1,5 @@
+[中文使用说明](README.zh-CN.md) | English
+
 # KK/KKS ScreenshotManager ReShade Output
 
 This fork publishes the Screencap/ScreenshotManager changes needed to export
@@ -25,6 +27,14 @@ BepisPlugins.
 4. For KK only, build `Native\OfflineDepthD3D11Bridge` and put
    `OfflineDepthD3D11Bridge.dll` next to `Screencap.dll`, or set
    `Offline ReShade Export > D3D11 bridge DLL path` to its absolute path.
+5. Start the game and verify the game-side export before opening the Offline
+   ReShade app. Press `LeftCtrl + F10` and confirm that
+   `UserData\cap\OfflineReShade` contains a valid `coloroutput.png`,
+   `depthoutput.rfloat`, and `metadata.json`.
+
+Do not continue to the app-side ReShade workflow until this check passes. The
+app consumes these files; it cannot fix a missing or empty game-side depth
+export.
 
 Native bridge build:
 
@@ -53,6 +63,19 @@ This project is published as three practical packages:
 Both KK packages export the same `.rfloat` format and metadata schema. The
 compatibility package repeatedly verifies and repairs D3D11 context hooks across
 captures, which improves reliability on troublesome Unity 5.6/plugin stacks.
+Do not mix files between the two KK packages: use the `Screencap.dll` and
+`OfflineDepthD3D11Bridge.dll` from the same release package.
+
+Recommended KK selection flow:
+
+1. Install **KK Stable Path** first.
+2. Press `LeftCtrl + F10` in Studio and inspect the exported color/depth pair.
+3. If stable does not create `depthoutput.rfloat`, creates it only once after a
+   restart, misses depth intermittently, or produces VideoExport frames without
+   matching depth sidecars, replace both DLLs with **KK Compatibility Bridge**.
+4. If compatibility still fails, disable MSAA, use a Studio camera/lens view
+   instead of free view, and capture a support log with
+   `D3D11 bridge candidate diagnostics` enabled.
 
 ## Performance Notes
 
@@ -84,6 +107,20 @@ ConfigurationManager section: `Offline ReShade Export`
 - KK `D3D11 bridge log path`: native bridge diagnostic log path.
 - KK `D3D11 bridge candidate diagnostics`: slow candidate sampling log for
   debugging wrong/empty depth frames. Keep it disabled for normal capture.
+
+Screenshot resolution is still controlled by ScreenshotManager's normal render
+screenshot settings. For Offline ReShade, color and depth must describe the same
+off-screen render:
+
+- Set the ScreenshotManager render resolution to the final image size you want
+  the app to process.
+- Keep the ScreenshotManager downscaling/supersampling settings intentional.
+  High supersampling increases both render cost and depth file size.
+- After changing resolution or downscaling, take one `LeftCtrl + F10` test shot
+  and confirm that `metadata.json` reports the expected `width`, `height`,
+  `depthWidth`, and `depthHeight`.
+- Do not judge app-side depth effects until this game-side color/depth pair is
+  confirmed to be the expected size and visually aligned.
 
 ## Output Files
 

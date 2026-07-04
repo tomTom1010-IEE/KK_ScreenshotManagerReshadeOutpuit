@@ -13,12 +13,11 @@
 ## 安装
 
 1. 为对应游戏安装 BepInEx 5 和常规 BepisPlugins 依赖。
-2. 安装对应游戏的 Screencap DLL：
-   - KK：`Screencap.dll`
-   - KKS：`KKS_Screencap.dll`
-3. 把 DLL 放入游戏的 `BepInEx\plugins`。
+2. 安装对应游戏的 Screencap DLL，替换 BepisPlugins 子目录里的原版文件：
+   - KK：`BepInEx\plugins\KK_BepisPlugins\Screencap.dll`
+   - KKS：`BepInEx\plugins\KKS_BepisPlugins\KKS_Screencap.dll`
 4. KK 还需要安装 `OfflineDepthD3D11Bridge.dll`：
-   - 推荐放在 `Screencap.dll` 旁边；
+   - 推荐放在 `BepInEx\plugins\KK_BepisPlugins\Screencap.dll` 旁边；
    - 或者在插件设置 `Offline ReShade Export > D3D11 bridge DLL path` 中填写绝对路径。
 5. 启动游戏后，先按 `LeftCtrl + F10` 做一次测试导出。
 6. 确认 `UserData\cap\OfflineReShade` 中生成了：

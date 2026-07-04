@@ -20,13 +20,15 @@ BepisPlugins.
 ## Install
 
 1. Install BepInEx 5 and the usual BepisPlugins dependencies for your game.
-2. Build this repository, or use the built Screencap DLL from your local build:
-   - KK: `Screencap.dll`
-   - KKS: `KKS_Screencap.dll`
-3. Put the Screencap DLL in the game's `BepInEx\plugins` folder.
+2. Build this repository, or use the built Screencap DLL from your local build.
+3. Replace the original Screencap DLL inside the game's BepisPlugins folder:
+   - KK: `BepInEx\plugins\KK_BepisPlugins\Screencap.dll`
+   - KKS: `BepInEx\plugins\KKS_BepisPlugins\KKS_Screencap.dll`
 4. For KK only, build `Native\OfflineDepthD3D11Bridge` and put
-   `OfflineDepthD3D11Bridge.dll` next to `Screencap.dll`, or set
-   `Offline ReShade Export > D3D11 bridge DLL path` to its absolute path.
+   `OfflineDepthD3D11Bridge.dll` next to
+   `BepInEx\plugins\KK_BepisPlugins\Screencap.dll`, or set
+   `Offline ReShade Export > D3D11 bridge DLL path` to the bridge DLL's
+   absolute path.
 5. Start the game and verify the game-side export before opening the Offline
    ReShade app. Press `LeftCtrl + F10` and confirm that
    `UserData\cap\OfflineReShade` contains a valid `coloroutput.png`,

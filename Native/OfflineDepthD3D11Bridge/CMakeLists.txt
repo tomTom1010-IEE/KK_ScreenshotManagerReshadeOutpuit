@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
-project(OfflineDepthD3D11Bridge LANGUAGES CXX)
+project(OfflineDepthD3D11Bridge LANGUAGES C CXX)
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "OfflineDepthD3D11Bridge requires an x64 toolchain")
+endif()
+
+add_library(ors_minhook STATIC
+    third_party/minhook/src/buffer.c third_party/minhook/src/hook.c
+    third_party/minhook/src/trampoline.c third_party/minhook/src/hde/hde64.c)
+target_include_directories(ors_minhook PUBLIC third_party/minhook/include)
 
 add_library(OfflineDepthD3D11Bridge SHARED bridge.cpp)
 set_target_properties(OfflineDepthD3D11Bridge PROPERTIES PREFIX "")
@@ -13,7 +21,7 @@ else()
     target_link_options(OfflineDepthD3D11Bridge PRIVATE -static-libgcc -static-libstdc++ -static)
 endif()
 
-target_link_libraries(OfflineDepthD3D11Bridge PRIVATE d3d11 dxgi d3dcompiler psapi)
+target_link_libraries(OfflineDepthD3D11Bridge PRIVATE d3d11 dxgi d3dcompiler psapi ors_minhook)
 
 option(ORS_BUILD_TESTS "Build standalone D3D11 WARP integration tests" OFF)
 if(ORS_BUILD_TESTS)
@@ -21,7 +29,7 @@ if(ORS_BUILD_TESTS)
     add_executable(OfflineDepthBridgeTests tests/bridge_tests.cpp)
     target_compile_features(OfflineDepthBridgeTests PRIVATE cxx_std_17)
     target_compile_definitions(OfflineDepthBridgeTests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX ORS_TESTING)
-    target_link_libraries(OfflineDepthBridgeTests PRIVATE d3d11 dxgi d3dcompiler psapi)
+    target_link_libraries(OfflineDepthBridgeTests PRIVATE d3d11 dxgi d3dcompiler psapi ors_minhook)
     if(NOT MSVC)
         target_compile_options(OfflineDepthBridgeTests PRIVATE -Wall -Wextra)
         target_link_options(OfflineDepthBridgeTests PRIVATE -static-libgcc -static-libstdc++ -static)

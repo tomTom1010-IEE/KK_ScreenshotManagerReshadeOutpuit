@@ -10,6 +10,13 @@ void Require(bool condition, const char* message)
     if (!condition) throw std::runtime_error(message);
 }
 void Hr(HRESULT result, const char* message) { Require(SUCCEEDED(result), message); }
+template<class Fn> Fn UnobservedOriginal(ID3D11DeviceContext* ctx, int method, Fn fallback)
+{
+    const auto original = OriginalFor(ctx, method, fallback);
+    for (const auto& route : g_entryRoutes[method])
+        if (route.target == reinterpret_cast<void*>(original)) return reinterpret_cast<Fn>(route.original);
+    return original;
+}
 
 struct Scene
 {
@@ -57,10 +64,11 @@ struct Scene
         rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE;
         Hr(device->CreateRasterizerState(&rd, raster.put()), "create scene raster state");
     }
-    void draw(ID3D11DeviceContext* ctx, float offset, float clear, bool empty = false)
+    void draw(ID3D11DeviceContext* ctx, float offset, float clear, bool empty = false, bool unobserved = false)
     {
         ctx->SetPredication(nullptr, FALSE);
-        ctx->ClearDepthStencilView(dsv.get(), D3D11_CLEAR_DEPTH, clear, 0);
+        if (unobserved) UnobservedOriginal(ctx, kClearDepthStencilView, g_ClearDepthStencilView)(ctx, dsv.get(), D3D11_CLEAR_DEPTH, clear, 0);
+        else ctx->ClearDepthStencilView(dsv.get(), D3D11_CLEAR_DEPTH, clear, 0);
         ctx->OMSetRenderTargets(0, nullptr, dsv.get());
         ctx->OMSetBlendState(nullptr, nullptr, UINT(-1));
         ctx->OMSetDepthStencilState(depth.get(), 0);
@@ -79,7 +87,8 @@ struct Scene
         ctx->UpdateSubresource(constants.get(), 0, nullptr, values, 0, 0);
         auto* cb = constants.get();
         ctx->PSSetConstantBuffers(0, 1, &cb);
-        ctx->Draw(3, 0);
+        if (unobserved) UnobservedOriginal(ctx, kDraw, g_Draw)(ctx, 3, 0);
+        else ctx->Draw(3, 0);
     }
 };
 
@@ -139,6 +148,24 @@ int Prepare(int width, int height, const std::filesystem::path& path)
 }
 void Begin(int id) { OnRenderEvent(kCaptureEventBase + id * 4); }
 void End(int id) { OnRenderEvent(kCaptureEventBase + id * 4 + 1); }
+void CameraMarker(int id, int index, bool ending, const wchar_t* label)
+{
+    const int event = ORS_PrepareCameraStageEvent(id, index, ending ? 1 : 0, label);
+    Require(event >= kCameraEventBase, "prepare camera marker");
+    OnRenderEvent(event);
+}
+std::string StageLine(const std::filesystem::path& log, int id, const char* stage, int camera)
+{
+    std::ifstream file(log);
+    const auto prefix = "stage_sample id=" + std::to_string(id) + " ";
+    const auto phase = std::string("stage=") + stage + " ";
+    const auto index = "cameraIndex=" + std::to_string(camera) + " ";
+    std::string line;
+    while (std::getline(file, line))
+        if (line.find(prefix) != std::string::npos && line.find(phase) != std::string::npos &&
+            line.find(index) != std::string::npos) return line;
+    throw std::runtime_error("diagnostic stage sample missing");
+}
 void VerifyImage(const std::filesystem::path& path, UINT w, UINT h, float offset)
 {
     Require(std::filesystem::exists(path), "depth file missing");
@@ -307,6 +334,242 @@ int main()
         Begin(id); OnRenderEvent(kCaptureEventBase + id*4 + 2);
         Require(ORS_GetDepthCaptureStatus(id) < 0, "cancel not reported");
         std::cout << "PASS resize, forward/reversed clear conventions, budget limit and cancellation\n";
+
+        ORS_SetStageDiagnosticsEnabled(1);
+        const auto erasedPath = folder/L"stage-erased.rfloat";
+        id = Prepare(67, 41, erasedPath);
+        // Prepare the first marker before Begin, like the managed submission thread.
+        const int marker = ORS_PrepareCameraStageEvent(id, 0, 0, L"WARP main");
+        Begin(id); OnRenderEvent(marker);
+        scene.draw(ctx.get(), .12f, 0);
+        const auto sceneDraws = g_drawCalls;
+        CameraMarker(id, 0, true, L"WARP main");
+        Require(g_drawCalls == sceneDraws, "camera sample polluted draw counters");
+        CameraMarker(id, 1, false, L"WARP child");
+        poison.apply(ctx.get());
+        const auto originalBinding = g_contextDsv.at(ctx.get());
+        // WARP can replace optimized vtable entries after pipeline changes. Exercise
+        // the clear hook directly here; stage markers also diagnose unobserved clears.
+        Hook_ClearDepthStencilView(ctx.get(), scene.dsv.get(), D3D11_CLEAR_DEPTH, 0, 0);
+        poison.verify(ctx.get());
+        Require(g_contextDsv.at(ctx.get()) == originalBinding && g_drawCalls == sceneDraws,
+            "pre-clear sample changed binding attribution or draw counters");
+        CameraMarker(id, 1, true, L"WARP child");
+        End(id); poison.verify(ctx.get());
+        Require(ORS_GetDepthCaptureStatus(id) < 0 && !std::filesystem::exists(erasedPath),
+            "diagnostic snapshot incorrectly became exported depth");
+        const auto mainEnd = StageLine(folder/L"probe.log", id, "camera_end", 0);
+        const auto beforeClear = StageLine(folder/L"probe.log", id, "before_clear", 1);
+        const auto stackEnd = StageLine(folder/L"probe.log", id, "stack_end", 1);
+        Require(mainEnd.find("nonClear=0 ") == std::string::npos && beforeClear.find("nonClear=0 ") == std::string::npos &&
+            stackEnd.find("nonClear=0 ") != std::string::npos, "diagnostics did not preserve depth before the clear");
+        std::cout << "PASS camera-end/pre-clear/stack-end diagnosis preserves historical small samples without exporting them\n";
+
+        // A previous frame can leave nonzero pixels; no fresh evidence still means no output.
+        scene.draw(ctx.get(), .26f, 0);
+        const auto unobservedPath = folder/L"stage-unobserved.rfloat";
+        id = Prepare(67, 41, unobservedPath);
+        Begin(id); CameraMarker(id, 0, false, L"WARP unobserved");
+        CameraMarker(id, 0, true, L"WARP unobserved"); End(id);
+        Require(ORS_GetDepthCaptureStatus(id) < 0 && !std::filesystem::exists(unobservedPath),
+            "unobserved diagnostic candidate bypassed freshness filtering");
+        const auto filtered = StageLine(folder/L"probe.log", id, "rejected_no_draw", 0);
+        Require(filtered.find("freshEvidence=0 ") != std::string::npos && filtered.find("nonClear=0 ") == std::string::npos &&
+            filtered.find("diagnosticOnly=true") != std::string::npos, "missing nonzero-but-filtered diagnosis");
+        std::cout << "PASS filtered no-draw candidate is sampled only for diagnostics and remains rejected\n";
+
+        id = Prepare(67, 41, folder/L"stage-unobserved-clear.rfloat");
+        Begin(id); CameraMarker(id, 0, false, L"WARP main");
+        scene.draw(ctx.get(), .31f, 0); CameraMarker(id, 0, true, L"WARP main");
+        CameraMarker(id, 1, false, L"WARP bypassed clear");
+        const auto observedClears = g_clearDsvCalls;
+        UnobservedOriginal(ctx.get(), kClearDepthStencilView, g_ClearDepthStencilView)(ctx.get(), scene.dsv.get(), D3D11_CLEAR_DEPTH, 0, 0);
+        CameraMarker(id, 1, true, L"WARP bypassed clear"); End(id);
+        Require(g_clearDsvCalls == observedClears && ORS_GetDepthCaptureStatus(id) < 0,
+            "unobserved clear unexpectedly changed counters or produced depth");
+        Require(StageLine(folder/L"probe.log", id, "camera_end", 0).find("nonClear=0 ") == std::string::npos &&
+            StageLine(folder/L"probe.log", id, "camera_end", 1).find("nonClear=0 ") != std::string::npos,
+            "camera markers did not reveal a clear that bypassed its hook");
+        std::cout << "PASS camera phase comparison reveals content loss even when the clear hook is bypassed\n";
+
+        id = Prepare(67, 41, folder/L"stage-bounded.rfloat");
+        Begin(id); scene.draw(ctx.get(), .19f, 0);
+        for (int stage = 0; stage < 100; ++stage) CameraMarker(id, stage, true, L"WARP repeated");
+        Require(g_stageSamples.size() == kMaxStageSamples && g_stageSlots.size() == kMaxStageSamples,
+            "diagnostic sample pool exceeded fixed capacity");
+        End(id); OnRenderEvent(2003);
+        VerifyImage(folder/L"stage-bounded.rfloat", 67, 41, .19f);
+        const auto warmAllocations = g_pipeline.textureAllocations;
+        for (int frame = 0; frame < 4; ++frame)
+        {
+            const auto path = folder/(L"stage-reuse-" + std::to_wstring(frame) + L".rfloat");
+            id = Prepare(67, 41, path); Begin(id);
+            scene.draw(ctx.get(), .21f, 0);
+            CameraMarker(id, 0, true, L"WARP reuse"); End(id); OnRenderEvent(2003);
+            VerifyImage(path, 67, 41, .21f);
+        }
+        Require(g_pipeline.textureAllocations == warmAllocations, "diagnostic textures were not reused");
+        std::cout << "PASS bounded/reusable diagnostic pool and unchanged successful float output\n";
+
+        ORS_SetStageDiagnosticsEnabled(0);
+        id = Prepare(67, 41, folder/L"stage-disabled.rfloat"); Begin(id);
+        Require(ORS_PrepareCameraStageEvent(id, 0, 1, L"disabled") == 0, "disabled diagnostics prepared a marker");
+        scene.draw(ctx.get(), .23f, 0);
+        Require(g_stageSamples.empty(), "disabled diagnostics queued samples");
+        End(id); OnRenderEvent(2003);
+        VerifyImage(folder/L"stage-disabled.rfloat", 67, 41, .23f);
+        Require(g_cameraEvents.empty(), "camera event payloads leaked after captures");
+        std::cout << "PASS disabled diagnostics submit no samples/events and release immutable marker payloads\n";
+
+        // Geometry moves in view-space depth while CPU Draw/Clear hooks are bypassed.
+        for (int frame = 0; frame < 24; ++frame)
+        {
+            const auto path = folder/(L"gpu-moving-" + std::to_wstring(frame) + L".rfloat");
+            id = Prepare(67, 41, path); Begin(id);
+            scene.draw(ctx.get(), .08f + frame*.01f, 0, false, true);
+            Require(g_drawCalls == 0 && g_clearDsvCalls == 0, "moving test did not bypass CPU write hooks");
+            End(id); OnRenderEvent(2003);
+            Require(g_writeEvidence.fresh(scene.texture.get()) && g_writeEvidence.samples(scene.texture.get()) > 0,
+                "actual GPU depth samples did not establish current-capture provenance");
+            VerifyImage(path, 67, 41, .08f + frame*.01f);
+        }
+        std::cout << "PASS 24 changing-depth frames: GPU proof recovers bypassed Draw/Clear without stale frames\n";
+
+        ors::ComPtr<ID3D11DepthStencilState> noWrite;
+        D3D11_DEPTH_STENCIL_DESC noWriteDesc{};
+        noWriteDesc.DepthEnable = TRUE; noWriteDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        noWriteDesc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        Hr(device->CreateDepthStencilState(&noWriteDesc, noWrite.put()), "create read-only depth state");
+        id = Prepare(67, 41, folder/L"no-depth-write.rfloat"); Begin(id);
+        ctx->OMSetRenderTargets(0, nullptr, scene.dsv.get());
+        ctx->OMSetDepthStencilState(noWrite.get(), 0);
+        ctx->Draw(3, 0);
+        End(id);
+        Require(ORS_GetDepthCaptureStatus(id) < 0 && !g_writeEvidence.fresh(scene.texture.get()),
+            "depth-write-disabled draw refreshed stale depth");
+        std::cout << "PASS a Draw with depth writes disabled cannot qualify nonzero historical depth\n";
+
+        Scene copySource(device.get(), 67, 41), copyDest(device.get(), 67, 41);
+        id = Prepare(67, 41, folder/L"fresh-copy.rfloat"); Begin(id);
+        copySource.draw(ctx.get(), .23f, 0, false, true);
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        ctx->CopyResource(copyDest.texture.get(), copySource.texture.get());
+        Hook_ClearDepthStencilView(ctx.get(), copySource.dsv.get(), D3D11_CLEAR_DEPTH, 0, 0);
+        ctx->OMSetRenderTargets(0, nullptr, copyDest.dsv.get());
+        End(id); OnRenderEvent(2003);
+        Require(g_writeEvidence.fresh(copyDest.texture.get()) &&
+            std::wstring(g_writeEvidence.reason(copyDest.texture.get())) == L"copy_from_current_capture", "copy provenance missing");
+        Require(g_writeEvidence.fullCopies == 1, "nested entry/vtable hooks double-counted a copy");
+        VerifyImage(folder/L"fresh-copy.rfloat", 67, 41, .23f);
+        std::cout << "PASS full copy inherits the submitted source version even if the source is later cleared\n";
+
+        // Copy first, write the source later: later GPU proof must not flow backward.
+        copySource.draw(ctx.get(), .14f, 0);
+        id = Prepare(67, 41, folder/L"future-source-write.rfloat"); Begin(id);
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        ctx->CopyResource(copyDest.texture.get(), copySource.texture.get());
+        ctx->OMSetRenderTargets(0, nullptr, copyDest.dsv.get());
+        copySource.draw(ctx.get(), .42f, 0, false, true);
+        End(id); OnRenderEvent(2003);
+        Require(!g_writeEvidence.fresh(copyDest.texture.get()) && g_writeEvidence.fresh(copySource.texture.get()),
+            "later source writes retroactively refreshed an earlier stale copy");
+        VerifyImage(folder/L"future-source-write.rfloat", 67, 41, .42f);
+        std::cout << "PASS time-ordered copy versions reject retroactive freshness from later source draws\n";
+
+        id = Prepare(67, 41, folder/L"previous-frame-copy.rfloat"); Begin(id);
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        ctx->CopyResource(copyDest.texture.get(), copySource.texture.get());
+        ctx->OMSetRenderTargets(0, nullptr, copyDest.dsv.get());
+        End(id);
+        Require(ORS_GetDepthCaptureStatus(id) < 0 && !g_writeEvidence.fresh(copyDest.texture.get()),
+            "a previous capture's source established current-capture provenance");
+        std::cout << "PASS previous-frame copy remains rejected despite nonzero pixels and matching dimensions\n";
+
+        id = Prepare(67, 41, folder/L"partial-copy.rfloat"); Begin(id);
+        copySource.draw(ctx.get(), .31f, 0, false, true);
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        D3D11_BOX region{0,0,0,16,16,1};
+        ctx->CopySubresourceRegion(copyDest.texture.get(), 0, 0, 0, 0, copySource.texture.get(), 0, &region);
+        ctx->OMSetRenderTargets(0, nullptr, copyDest.dsv.get());
+        End(id); OnRenderEvent(2003);
+        Require(!g_writeEvidence.fresh(copyDest.texture.get()), "partial copy qualified an otherwise stale destination");
+        std::cout << "PASS partial updates cannot qualify untouched historical pixels\n";
+
+        ors::testWriteQueryUnavailable = true;
+        id = Prepare(67, 41, folder/L"gpu-query-unavailable.rfloat"); Begin(id);
+        scene.draw(ctx.get(), .28f, 0, false, true); End(id);
+        Require(ORS_GetDepthCaptureStatus(id) < 0 && !std::filesystem::exists(folder/L"gpu-query-unavailable.rfloat"),
+            "missing GPU proof fell back to accepting an unobserved candidate");
+        ors::testWriteQueryUnavailable = false;
+        std::cout << "PASS unavailable GPU evidence fails closed without accepting a nonzero unobserved texture\n";
+
+        ors::ComPtr<ID3D11DeviceContext> deferred;
+        Hr(device->CreateDeferredContext(0, deferred.put()), "create deferred context");
+        scene.draw(ctx.get(), .19f, 0);
+        id = Prepare(67, 41, folder/L"deferred-not-executed.rfloat"); Begin(id);
+        scene.draw(deferred.get(), .25f, 0);
+        End(id);
+        Require(ORS_GetDepthCaptureStatus(id) < 0 && !g_writeEvidence.fresh(scene.texture.get()),
+            "recorded-but-unexecuted deferred calls qualified stale depth");
+        std::cout << "PASS deferred recording alone cannot establish current-frame GPU provenance\n";
+
+        ors::ComPtr<ID3D11CommandList> commandList;
+        Hr(deferred->FinishCommandList(FALSE, commandList.put()), "finish unverified command list");
+        id = Prepare(67, 41, folder/L"unverified-command-list.rfloat"); Begin(id);
+        scene.draw(ctx.get(), .21f, 0, false, true);
+        ctx->ExecuteCommandList(commandList.get(), TRUE);
+        End(id);
+        Require(ORS_GetDepthCaptureStatus(id) < 0 && !g_writeEvidence.fresh(scene.texture.get()) &&
+            g_writeEvidence.commandLists == 1, "unverified command list retained earlier depth provenance");
+        Require(!std::filesystem::exists(folder/L"unverified-command-list.rfloat"), "unverified execution exported depth");
+        std::cout << "PASS command-list execution invalidates earlier evidence without double counting\n";
+
+        id = Prepare(67, 41, folder/L"clear-state-no-write.rfloat"); Begin(id);
+        ctx->OMSetRenderTargets(0, nullptr, scene.dsv.get());
+        ctx->ClearState();
+        ctx->OMSetRenderTargets(0, nullptr, scene.dsv.get());
+        ctx->OMSetDepthStencilState(noWrite.get(), 0);
+        ctx->Draw(3, 0);
+        End(id);
+        Require(ORS_GetDepthCaptureStatus(id) < 0 && !g_writeEvidence.fresh(scene.texture.get()),
+            "state reset allowed stale evidence to qualify historical depth");
+        std::cout << "PASS state reset and depth-write-disabled draw do not certify historical pixels\n";
+
+        ors::ComPtr<ID3D11Query> externalQuery;
+        D3D11_QUERY_DESC externalDesc{}; externalDesc.Query = D3D11_QUERY_OCCLUSION;
+        Hr(device->CreateQuery(&externalDesc, externalQuery.put()), "create application occlusion query");
+        id = Prepare(67, 41, folder/L"nested-query.rfloat"); Begin(id);
+        ctx->Begin(externalQuery.get());
+        scene.draw(ctx.get(), .24f, 0, false, true);
+        ctx->End(externalQuery.get());
+        End(id); OnRenderEvent(2003);
+        VerifyImage(folder/L"nested-query.rfloat", 67, 41, .24f);
+        UINT64 passed = 0;
+        Hr(ctx->GetData(externalQuery.get(), &passed, sizeof(passed), 0), "read application query");
+        Require(passed == 67*41, "bridge queries changed application sample counts");
+        std::cout << "PASS nested application occlusion query retains exact sample counts\n";
+
+        ors::ComPtr<ID3D11Device> hardwareDevice;
+        ors::ComPtr<ID3D11DeviceContext> hardwareContext;
+        const auto hardwareResult = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, hardwareDevice.put(), &selected, hardwareContext.put());
+        if (SUCCEEDED(hardwareResult))
+        {
+            Scene hardwareScene(hardwareDevice.get(), 67, 41);
+            Require(ORS_SetUnityD3D11Texture(hardwareScene.texture.get()) == 0, "switch to hardware context");
+            for (int frame = 0; frame < 8; ++frame)
+            {
+                const auto path = folder/(L"hardware-moving-" + std::to_wstring(frame) + L".rfloat");
+                id = Prepare(67, 41, path); Begin(id);
+                hardwareScene.draw(hardwareContext.get(), .12f + frame*.015f, 0, false, true);
+                End(id); OnRenderEvent(2003);
+                VerifyImage(path, 67, 41, .12f + frame*.015f);
+                Require(g_writeEvidence.samples(hardwareScene.texture.get()) > 0, "hardware GPU write evidence absent");
+            }
+            hardwareContext->ClearState();
+            std::cout << "PASS hardware D3D11 driver: changing float depth and GPU proof with CPU hooks bypassed\n";
+        }
+        else std::cout << "SKIP hardware D3D11 device unavailable (WARP tests passed)\n";
 
         Require(g_pendingDepthReadbacks.empty(), "final readbacks still pending");
         ctx->ClearState();

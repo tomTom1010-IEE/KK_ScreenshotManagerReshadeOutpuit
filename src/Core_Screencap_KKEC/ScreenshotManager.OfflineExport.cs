@@ -23,6 +23,7 @@ namespace Screencap
         private static ConfigEntry<string> OfflineReShadeD3D11DepthBridgeDllPath { get; set; }
         private static ConfigEntry<string> OfflineReShadeD3D11DepthBridgeLogPath { get; set; }
         private static ConfigEntry<bool> OfflineReShadeD3D11CandidateDiagnosticsEnabled { get; set; }
+        private static ConfigEntry<bool> OfflineReShadeD3D11StageDiagnosticsEnabled { get; set; }
         private static ConfigEntry<bool> OfflineReShadeD3D11MemoryLogging { get; set; }
         private static ConfigEntry<int> OfflineReShadeD3D11ReadbackBudget { get; set; }
         private static ConfigEntry<bool> OfflineReShadeKkEnvironmentFingerprintEnabled { get; set; }
@@ -101,6 +102,8 @@ namespace Screencap
             private delegate int OrsConfigureReadbackDelegate(int budgetMiB, int memoryLogging, int reversedZ);
             [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
             private delegate int OrsSetCandidateDiagnosticsEnabledDelegate(int enabled);
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+            private delegate int OrsPrepareCameraStageEventDelegate(int captureId, int cameraIndex, int ending, string label);
 
             [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
             private static extern IntPtr LoadLibrary(string lpFileName);
@@ -120,6 +123,8 @@ namespace Screencap
             private static OrsSetDepthRFloatOutputPathDelegate _setDepthRFloatOutputPath;
             private static OrsGetDepthCaptureStatusDelegate _getDepthCaptureStatus;
             private static OrsSetCandidateDiagnosticsEnabledDelegate _setCandidateDiagnosticsEnabled;
+            private static OrsSetCandidateDiagnosticsEnabledDelegate _setStageDiagnosticsEnabled;
+            private static OrsPrepareCameraStageEventDelegate _prepareCameraStageEvent;
             private static IntPtr _renderEventFunc;
             private static int _captureId;
             private static bool _beginSubmitted;
@@ -138,6 +143,7 @@ namespace Screencap
                 depthPath = Path.GetFullPath(depthPath);
                 Directory.CreateDirectory(Path.GetDirectoryName(depthPath));
                 SetCandidateDiagnosticsEnabled(OfflineReShadeD3D11CandidateDiagnosticsEnabled != null && OfflineReShadeD3D11CandidateDiagnosticsEnabled.Value);
+                _setStageDiagnosticsEnabled(OfflineReShadeD3D11StageDiagnosticsEnabled.Value ? 1 : 0);
                 _configureReadback(OfflineReShadeD3D11ReadbackBudget.Value,
                     OfflineReShadeD3D11MemoryLogging.Value ? 1 : 0, SystemInfo.usesReversedZBuffer ? 1 : 0);
                 var result = _beginCapture(width, height, label);
@@ -187,6 +193,25 @@ namespace Screencap
                     return;
 
                 GL.IssuePluginEvent(_renderEventFunc, 2003);
+            }
+
+            public static void IssueCameraStageEvent(int index, Camera camera, bool ending)
+            {
+                if (!_initialized || !_beginSubmitted || _endSubmitted || _captureId <= 0 ||
+                    !OfflineReShadeD3D11StageDiagnosticsEnabled.Value)
+                    return;
+                try
+                {
+                    var eventId = _prepareCameraStageEvent(_captureId, index, ending ? 1 : 0, GetTransformPath(camera.transform));
+                    if (eventId > 0)
+                        GL.IssuePluginEvent(_renderEventFunc, eventId);
+                    else if (eventId < 0)
+                        Logger.LogWarning("Offline ReShade camera stage diagnostic marker could not be prepared.");
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogWarning("Offline ReShade camera stage diagnostics skipped: " + ex.Message);
+                }
             }
 
             public static int GetLastDepthQueueResult()
@@ -244,8 +269,8 @@ namespace Screencap
                 try
                 {
                     var getApiVersion = (OrsGetBridgeApiVersionDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_GetBridgeApiVersion"), typeof(OrsGetBridgeApiVersionDelegate));
-                    if (getApiVersion() != 2)
-                        throw new InvalidOperationException("This KK test build requires the matching depth-pressure bridge (API 2). Install both test DLLs together.");
+                    if (getApiVersion() != 4)
+                        throw new InvalidOperationException("This KK test build requires the matching write-evidence bridge (API 4). Install both test DLLs together.");
                     _initialize = (OrsInitializeDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_Initialize"), typeof(OrsInitializeDelegate));
                     _shutdown = (OrsShutdownDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_Shutdown"), typeof(OrsShutdownDelegate));
                     _beginCapture = (OrsBeginCaptureDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_BeginCapture"), typeof(OrsBeginCaptureDelegate));
@@ -256,6 +281,8 @@ namespace Screencap
                     _setDepthRFloatOutputPath = (OrsSetDepthRFloatOutputPathDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_SetDepthRFloatOutputPath"), typeof(OrsSetDepthRFloatOutputPathDelegate));
                     _getDepthCaptureStatus = (OrsGetDepthCaptureStatusDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_GetDepthCaptureStatus"), typeof(OrsGetDepthCaptureStatusDelegate));
                     _setCandidateDiagnosticsEnabled = (OrsSetCandidateDiagnosticsEnabledDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_SetCandidateDiagnosticsEnabled"), typeof(OrsSetCandidateDiagnosticsEnabledDelegate));
+                    _setStageDiagnosticsEnabled = (OrsSetCandidateDiagnosticsEnabledDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_SetStageDiagnosticsEnabled"), typeof(OrsSetCandidateDiagnosticsEnabledDelegate));
+                    _prepareCameraStageEvent = (OrsPrepareCameraStageEventDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_PrepareCameraStageEvent"), typeof(OrsPrepareCameraStageEventDelegate));
 
                     var logPath = Path.GetFullPath(OfflineReShadeD3D11DepthBridgeLogPath.Value);
                     Directory.CreateDirectory(Path.GetDirectoryName(logPath));
@@ -274,7 +301,7 @@ namespace Screencap
                     }
 
                     _initialized = true;
-                    Logger.LogInfo("Offline ReShade KK depth-pressure test v1 (API 2) initialized: " + dllPath);
+                    Logger.LogInfo("Offline ReShade KK depth write evidence test v3 (API 4) initialized: " + dllPath);
                     return true;
                 }
                 catch (Exception ex)
@@ -650,7 +677,7 @@ namespace Screencap
                     AppendKkEnvironmentLogLine("[OfflineReShadeCameraStack] begin context=" + timingLabel + " count=" + (children.Length + 1) + " mode=" + mode);
                     states = ApplyKkCameraStackTarget(new[] { root }, target);
                     LogKkCameraRender(0, root, mode, true);
-                    root.Render();
+                    RenderKkCameraWithDiagnostics(root, 0);
                     RestoreKkCameraStackTarget(states);
                     states = null;
 
@@ -662,7 +689,7 @@ namespace Screencap
                         try
                         {
                             camera.depthTextureMode |= DepthTextureMode.Depth;
-                            camera.Render();
+                            RenderKkCameraWithDiagnostics(camera, i + 1);
                         }
                         finally
                         {
@@ -696,7 +723,7 @@ namespace Screencap
                 {
                     var camera = stack[i];
                     LogKkCameraRender(i, camera, mode, true);
-                    camera.Render();
+                    RenderKkCameraWithDiagnostics(camera, i);
                 }
                 AppendKkEnvironmentLogLine("[OfflineReShadeCameraStack] end context=" + timingLabel + " mode=" + mode);
             }
@@ -704,6 +731,13 @@ namespace Screencap
             {
                 RestoreKkCameraStackTarget(states);
             }
+        }
+
+        private static void RenderKkCameraWithDiagnostics(Camera camera, int index)
+        {
+            D3D11DepthBridge.IssueCameraStageEvent(index, camera, false);
+            try { camera.Render(); }
+            finally { D3D11DepthBridge.IssueCameraStageEvent(index, camera, true); }
         }
 
         private static void LogKkDepthMissingHint(string context)
@@ -780,6 +814,12 @@ namespace Screencap
                 "D3D11 bridge candidate diagnostics",
                 false,
                 "When enabled, the native D3D11 bridge samples every readable DSV candidate and logs nonzero/min/max stats. This is slow and intended only for debugging empty or wrong depth frames.");
+
+            OfflineReShadeD3D11StageDiagnosticsEnabled = Config.Bind(
+                "Offline ReShade Export",
+                "D3D11 bridge capture stage diagnostics",
+                true,
+                "KK diagnostic test only: queues small GPU samples at each camera end, before depth clears and at stack end. Failed captures also sample candidates rejected for missing draw/clear evidence. Samples only produce logs and never replace exported depth. Adds diagnostic overhead; disable for performance comparisons.");
 
             OfflineReShadeD3D11MemoryLogging = Config.Bind(
                 "Offline ReShade Export",

@@ -270,7 +270,7 @@ namespace Screencap
                 {
                     var getApiVersion = (OrsGetBridgeApiVersionDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_GetBridgeApiVersion"), typeof(OrsGetBridgeApiVersionDelegate));
                     if (getApiVersion() != 4)
-                        throw new InvalidOperationException("This KK test build requires the matching write-evidence bridge (API 4). Install both test DLLs together.");
+                        throw new InvalidOperationException("This KK hotfix requires the matching write-evidence bridge (API 4). Install both DLLs from the same release package together.");
                     _initialize = (OrsInitializeDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_Initialize"), typeof(OrsInitializeDelegate));
                     _shutdown = (OrsShutdownDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_Shutdown"), typeof(OrsShutdownDelegate));
                     _beginCapture = (OrsBeginCaptureDelegate)Marshal.GetDelegateForFunctionPointer(GetRequiredProc("ORS_BeginCapture"), typeof(OrsBeginCaptureDelegate));
@@ -301,7 +301,7 @@ namespace Screencap
                     }
 
                     _initialized = true;
-                    Logger.LogInfo("Offline ReShade KK depth write evidence test v3 (API 4) initialized: " + dllPath);
+                    Logger.LogInfo("Offline ReShade KK depth hotfix 21.1.3.4 (API 4) initialized: " + dllPath);
                     return true;
                 }
                 catch (Exception ex)
@@ -818,25 +818,25 @@ namespace Screencap
             OfflineReShadeD3D11StageDiagnosticsEnabled = Config.Bind(
                 "Offline ReShade Export",
                 "D3D11 bridge capture stage diagnostics",
-                true,
-                "KK diagnostic test only: queues small GPU samples at each camera end, before depth clears and at stack end. Failed captures also sample candidates rejected for missing draw/clear evidence. Samples only produce logs and never replace exported depth. Adds diagnostic overhead; disable for performance comparisons.");
+                false,
+                "Support diagnostics only: queues small GPU samples at each camera end, before depth clears and at stack end. Failed captures also sample unproven candidates. Samples only produce logs and never replace exported depth. Keep disabled for normal capture and performance comparisons; current-capture write validation remains active.");
 
             OfflineReShadeD3D11MemoryLogging = Config.Bind(
                 "Offline ReShade Export",
                 "D3D11 bridge memory pressure log",
                 true,
-                "KK test build: logs available RAM/commit, DXGI local/shared memory budgets, texture-pool bytes and pending readbacks once per capture. Allocation and readback failures are always logged.");
+                "Logs available RAM/commit, DXGI local/shared memory budgets, texture-pool bytes and pending readbacks at capture boundaries. Allocation and readback failures are always logged.");
 
             OfflineReShadeD3D11ReadbackBudget = Config.Bind(
                 "Offline ReShade Export",
                 "D3D11 bridge readback budget MiB",
                 512,
-                new ConfigDescription("KK test build: bounds the reusable RFloat output plus staging pool. Under memory pressure only one staging slot is used. A capture requires two full-resolution float textures plus scratch space.", new AcceptableValueRange<int>(64, 4096)));
+                new ConfigDescription("Bounds the reusable RFloat output plus staging pool. Under memory pressure only one staging slot is used. A capture requires two full-resolution float textures plus scratch space.", new AcceptableValueRange<int>(64, 4096)));
 
             OfflineReShadeKkEnvironmentFingerprintEnabled = Config.Bind(
                 "Offline ReShade Export",
                 "KK environment fingerprint log",
-                true,
+                false,
                 "Writes a KK-only environment/camera/settings fingerprint to the game log and offline_reshade_env.log for comparing machines with unstable depth capture.");
 
             OfflineReShadeKkEnvironmentLogPath = Config.Bind(
@@ -849,7 +849,7 @@ namespace Screencap
                 "Offline ReShade Export",
                 "KK camera render mode",
                 KkCameraRenderMode.MainAndChildren,
-                "Test build option: MainOnly=Camera.main only; MainAndChildren=Camera.main plus enabled children by camera.depth; ChildrenThenMain=enabled children first, then Camera.main; MainOnlyPlusNaturalStack=Camera.main retargeted, then child cameras rendered with their natural targets.");
+                "Advanced camera stack option. Default MainAndChildren renders Camera.main plus enabled children by camera.depth. Other modes are for troubleshooting: MainOnly=Camera.main only; ChildrenThenMain=children first; MainOnlyPlusNaturalStack=Camera.main retargeted, then children with their natural targets.");
 #endif
         }
 

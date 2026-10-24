@@ -1,5 +1,7 @@
 # KK 本帧深度写入证据测试版 v3
 
+> 本文保留 v1-v3 测试版记录。正式 hotfix 21.1.3.4 的安装与设置见[中文使用说明](../../../README.zh-CN.md)。正式版阶段诊断默认关闭，日志标识为 `kk-depth-hotfix-21.1.3.4`，不再使用下文的测试版标识。
+
 分支：`test/kk-depth-pressure`。Screencap 版本：`21.1.3.3`。
 Native bridge 标识：`kk-depth-write-evidence-v3`，API 版本：`4`。
 

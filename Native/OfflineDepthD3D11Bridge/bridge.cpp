@@ -1619,7 +1619,7 @@ extern "C" __declspec(dllexport) int ORS_Initialize(const wchar_t* logPath) try
     if (!logPath || !*logPath) return kError;
     g_log.open(logPath, std::ios::out | std::ios::app);
     if (!g_log.is_open()) return kError;
-    LogLineNoLock(L"initialize build=kk-depth-write-evidence-v3 api=4");
+    LogLineNoLock(L"initialize build=kk-depth-hotfix-21.1.3.4 api=4");
     if (MH_Initialize() != MH_OK) return kError;
     g_slots.reserve(kMaxPoolSlots);
     g_pendingDepthReadbacks.reserve(kMaxPoolSlots);

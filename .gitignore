@@ -12,6 +12,7 @@
 !/nuget.config
 !/README.md
 !/README.zh-CN.md
+!/RELEASE_NOTES.md
 !/LICENSE
 !/release.ps1
 !/Native/

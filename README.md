@@ -7,6 +7,19 @@ Offline ReShade inputs from Koikatu and Koikatsu Sunshine. It is intentionally
 scoped to the Screencap plugin even though the working tree is based on
 BepisPlugins.
 
+## KK Hotfix 21.1.3.4
+
+The [KK depth hotfix](https://github.com/tomTom1010-IEE/KK_ScreenshotManagerReshadeOutpuit/releases/tag/KKHotfix-21.1.3.4)
+fixes intermittent missing off-screen depth by strengthening render-thread capture
+timing, D3D11 hook coverage and current-capture write evidence. Install both
+`Screencap.dll` and `OfflineDepthD3D11Bridge.dll` from this package together (bridge
+API 4). No extra MinHook DLL or replacement shader bundle is required.
+
+This is a KK x64 / D3D11-only release. KKS and the previous Stable/Compatibility
+packages remain available in the [previous release](https://github.com/tomTom1010-IEE/KK_ScreenshotManagerReshadeOutpuit/releases/tag/Release0704_main).
+The paired VideoExport plugin does not need an update for this hotfix.
+See [release notes](RELEASE_NOTES.md) for validation results and limitations.
+
 ## What This Adds
 
 - `Ctrl+F10` Offline ReShade export in ScreenshotManager.
@@ -50,7 +63,7 @@ off-screen device depth.
 
 ## Release Variants
 
-This project is published as three practical packages:
+The previous release provides these three packages:
 
 - **KKS Screencap**: `KKS_Screencap.dll` only. KKS uses Unity 2019.4 camera
   depth texture export and does not need the native D3D11 bridge.
@@ -68,27 +81,36 @@ captures, which improves reliability on troublesome Unity 5.6/plugin stacks.
 Do not mix files between the two KK packages: use the `Screencap.dll` and
 `OfflineDepthD3D11Bridge.dll` from the same release package.
 
+**KK Depth Hotfix 21.1.3.4** adds persistent implementation-entry hooks, GPU
+depth-write evidence and bounded texture reuse on top of the compatibility path.
+It keeps the same `.rfloat` and metadata format. Use it when either older KK
+package intermittently misses depth; do not mix DLLs between releases.
+
 Recommended KK selection flow:
 
-1. Install **KK Stable Path** first.
+1. New KK users, or users with missing depth, should install **KK Depth Hotfix**.
 2. Press `LeftCtrl + F10` in Studio and inspect the exported color/depth pair.
-3. If stable does not create `depthoutput.rfloat`, creates it only once after a
-   restart, misses depth intermittently, or produces VideoExport frames without
-   matching depth sidecars, replace both DLLs with **KK Compatibility Bridge**.
-4. If compatibility still fails, disable MSAA, use a Studio camera/lens view
-   instead of free view, and capture a support log with
-   `D3D11 bridge candidate diagnostics` enabled.
+3. If an older **KK Stable Path** or **KK Compatibility Bridge** package already
+   works reliably, it can be kept. Upgrade both DLLs to the hotfix if depth is
+   missing after restart, intermittently absent, or absent from VideoExport frames.
+4. If the hotfix still fails, disable MSAA, use a Studio camera/lens view instead
+   of free view, and disable Optimize in Background while testing. Enable
+   diagnostics only when collecting support logs.
 
 ## Performance Notes
 
-Normal capture should keep `D3D11 bridge candidate diagnostics` disabled. The
-candidate diagnostics mode is for support logs only and adds measurable overhead.
+Normal capture should keep `D3D11 bridge candidate diagnostics` and
+`D3D11 bridge capture stage diagnostics` disabled. Both are support diagnostics,
+not prerequisites for current-capture write validation. The hotfix also defaults
+`KK environment fingerprint log` to disabled. Existing configuration values are
+preserved, so check these options after upgrading from a test build.
 
-In same-KK testing, the compatibility bridge is within roughly 10% of the
-lighter stable path. This is the expected release tradeoff: if a KK environment
-cannot use the stable path reliably, the compatibility package gives stable
-color/depth output with a small performance cost. Most remaining frame time is
-spent in color readback and PNG encoding rather than the D3D11 depth bridge.
+Earlier testing of the older compatibility bridge was within roughly 10% of the
+lighter stable path in one KK environment. That is not a performance guarantee
+for this hotfix, which adds GPU write-evidence queries. Recent short-sequence
+testing showed lower native capture-window time with stage diagnostics disabled,
+but no overall export speedup; color readback and PNG encoding remained the main
+cost. There is no universal KK/KKS performance percentage.
 
 Do not use unrelated KK/KKS scenes to calculate exact performance deltas. Scene
 complexity, texture size, ScreenshotManager supersampling, MSAA, and whether the
@@ -109,6 +131,15 @@ ConfigurationManager section: `Offline ReShade Export`
 - KK `D3D11 bridge log path`: native bridge diagnostic log path.
 - KK `D3D11 bridge candidate diagnostics`: slow candidate sampling log for
   debugging wrong/empty depth frames. Keep it disabled for normal capture.
+- KK `D3D11 bridge capture stage diagnostics`: small samples at camera/clear/stack
+  boundaries, for support only; default disabled in the hotfix.
+- KK `D3D11 bridge readback budget MiB`: default `512`; bounds reusable conversion
+  and staging pixel buffers, not total game RAM/VRAM. Very large captures may need
+  a higher budget; a capture needs two full-resolution float buffers plus scratch.
+- KK `D3D11 bridge memory pressure log`: logs memory and pool state; allocation
+  and readback failures are reported even if this option is disabled.
+- KK `KK environment fingerprint log`: optional environment/camera support log;
+  default disabled in the hotfix.
 
 Screenshot resolution is still controlled by ScreenshotManager's normal render
 screenshot settings. For Offline ReShade, color and depth must describe the same
@@ -186,19 +217,30 @@ depth, and exports it as raw float depth.
 KK uses Unity 5.6.2, where `BuiltinRenderTextureType.Depth` is not reliable for
 this off-screen render path. The native bridge hooks the Unity D3D11 immediate
 context during the `Camera.Render()` window, records depth-stencil views, checks
-readable non-MSAA candidates for nonzero content, copies the selected depth to
-an `R32_FLOAT` texture, then writes delayed staging readbacks to `.rfloat`.
-Empty candidates are not written; the plugin logs a warning instead of saving
-fake depth.
+exact-size readable non-MSAA candidates, copies the selected depth to an
+`R32_FLOAT` texture, then writes delayed staging readbacks to `.rfloat`.
+The hotfix brackets collection with ordered render-thread events, repairs
+per-context hooks and statically links MinHook for persistent implementation-entry
+hooks. GPU queries verify passing depth samples while depth writes are enabled.
+Current full clears and time-ordered copies from proven resources are also
+tracked; CPU Draw counts or nonzero pixels alone do not establish freshness.
+Unproven, all-clear or invalid candidates are not written. Bridge rendering saves
+and restores the affected pipeline state, and conversion/staging textures are
+reused within a configurable memory budget. Unverified command-list execution
+invalidates existing evidence rather than silently accepting historical depth.
 
 KK reliability notes:
 
-- Use a Studio camera/lens view for stable depth capture. Free-view screenshots
-  can miss the D3D11 depth pass in Unity 5.6.
+- If depth is missing, retry with a Studio camera/lens view. Recent hotfix testing
+  no longer reproduced the missed-capture issue in the tested scene, but does not
+  prove all free-view/plugin/driver combinations are supported.
 - Disable MSAA if depth is missing or the log reports MSAA/non-readable DSVs.
 - Disable Optimize in Background while testing user reports.
 - Candidate diagnostics are for troubleshooting only and should stay off for
   normal recording.
+- Stage diagnostics should also stay off. Current-capture validation remains on
+  when both diagnostics options are off. Real low-memory and other-device
+  reliability are not guaranteed by the completed single-environment tests.
 
 This bridge is archived here rather than in a separate repository because it is
 tightly coupled to ScreenshotManager's off-screen export timing and metadata.

@@ -10,17 +10,29 @@
 
 这些文件生成正确之后，才进入 Offline ReShade app 侧继续处理。
 
+## KK Hotfix 21.1.3.4
+
+本次 [KK 深度 hotfix](https://github.com/tomTom1010-IEE/KK_ScreenshotManagerReshadeOutpuit/releases/tag/KKHotfix-21.1.3.4) 修复离屏截图偶发缺深度的问题，改进捕获时序、hook 覆盖和本帧写入验证。
+
+- 仅适用于 KK x64 / D3D11。
+- 必须一起更新本包的 `Screencap.dll` 和 `OfflineDepthD3D11Bridge.dll`，对应 bridge API 4。
+- 不需要额外安装 MinHook DLL 或旧的 replacement shader bundle。
+- 配套 VideoExport 不需要重新安装，继续使用 `Normal + Depth`。
+- KKS 不使用本包，继续使用[上一正式版的 KKS 发布包](https://github.com/tomTom1010-IEE/KK_ScreenshotManagerReshadeOutpuit/releases/tag/Release0704_main)。旧 KK Stable/Compatibility 发布包也保留不变。
+
+阶段诊断与环境指纹日志在正式 hotfix 中默认关闭。旧配置不会自动重置，从测试版升级时请手动检查这些选项。
+
 ## 安装
 
 1. 为对应游戏安装 BepInEx 5 和常规 BepisPlugins 依赖。
 2. 安装对应游戏的 Screencap DLL，替换 BepisPlugins 子目录里的原版文件：
    - KK：`BepInEx\plugins\KK_BepisPlugins\Screencap.dll`
    - KKS：`BepInEx\plugins\KKS_BepisPlugins\KKS_Screencap.dll`
-4. KK 还需要安装 `OfflineDepthD3D11Bridge.dll`：
+3. KK 还需要安装 `OfflineDepthD3D11Bridge.dll`：
    - 推荐放在 `BepInEx\plugins\KK_BepisPlugins\Screencap.dll` 旁边；
    - 或者在插件设置 `Offline ReShade Export > D3D11 bridge DLL path` 中填写绝对路径。
-5. 启动游戏后，先按 `LeftCtrl + F10` 做一次测试导出。
-6. 确认 `UserData\cap\OfflineReShade` 中生成了：
+4. 启动游戏后，先按 `LeftCtrl + F10` 做一次测试导出。
+5. 确认 `UserData\cap\OfflineReShade` 中生成了：
 
 ```text
 coloroutput.png
@@ -32,7 +44,7 @@ metadata.json
 
 ## 发布版本选择
 
-发布包分为三类：
+旧版提供以下三类包，本次另增加 KK Depth Hotfix：
 
 - **KKS Screencap**
   - 只需要 `KKS_Screencap.dll`。
@@ -48,12 +60,14 @@ metadata.json
 
 KK 两个版本输出同样的 `.rfloat` 深度格式和 metadata。不要混用两个包里的 DLL：`Screencap.dll` 和 `OfflineDepthD3D11Bridge.dll` 必须来自同一个发布包。
 
+**KK Depth Hotfix 21.1.3.4** 在 compatibility 路径上增加持久入口 hook、GPU 本帧写入证据及受预算限制的纹理复用，输出格式保持不变。旧 stable 或 compatibility 偶发缺深度时，请升级到这个 hotfix，而不是混用新旧 DLL。
+
 推荐 KK 选择流程：
 
-1. 先安装 **KK Stable Path**。
+1. 新 KK 用户或遇到缺深度的用户，安装 **KK Depth Hotfix**。
 2. 在 Studio 中按 `LeftCtrl + F10`，检查 color/depth 是否都能生成。
-3. 如果 stable 不生成 `depthoutput.rfloat`、重启后只有第一张有深度、偶发缺深度，或 VideoExport 帧序列偶发缺 depth，请替换为 **KK Compatibility Bridge**。
-4. 如果 compatibility 仍失败，关闭 MSAA，使用 Studio 镜头/相机视角而不是自由视角，并开启 `D3D11 bridge candidate diagnostics` 生成支持日志。
+3. 已经使用旧 **KK Stable Path** 或 **KK Compatibility Bridge** 且始终稳定的用户可以继续保留。若不生成深度、重启后只有第一张成功，或 VE 偶发缺 depth，请成对升级两个 DLL。
+4. hotfix 仍失败时，关闭 MSAA，尝试 Studio 镜头/相机视角，测试时关闭 Optimize in Background；需要支持日志时再开启诊断选项。
 
 ## 设置
 
@@ -81,6 +95,16 @@ Offline ReShade Export
   - native bridge 诊断日志路径。
 - KK `D3D11 bridge candidate diagnostics`
   - 用于排查空深度、错深度或错分辨率。正常截图和录制时建议关闭。
+- KK `D3D11 bridge capture stage diagnostics`
+  - 相机结束、清除前和相机栈结束时的小尺寸诊断采样。正式 hotfix 默认关闭，正常截图和录制也请关闭。
+- KK `D3D11 bridge readback budget MiB`
+  - 默认 `512`，限制桥接转换与读回纹理池，而不是整个游戏的内存或显存。超大截图可能需要提高；至少需要两张全分辨率 float 纹理和少量临时空间。
+- KK `D3D11 bridge memory pressure log`
+  - 记录内存、显存和纹理池状态。即使关闭，分配及读回失败仍会记录。
+- KK `KK environment fingerprint log`
+  - 排查环境差异时使用的详细日志，正式 hotfix 默认关闭。
+
+关闭 candidate/stage diagnostics 不会关闭本帧写入验证，插件仍会拒绝未经验证的旧深度。
 
 ## 截图分辨率
 
@@ -154,14 +178,17 @@ KK 使用 Unity 5.6.2，不能可靠通过 Unity API 获取离屏 Camera.Render 
 - 优先使用 Studio 镜头/相机视角截图，自由视角在部分环境中不稳定。
 - 关闭 MSAA。
 - 测试时关闭 Optimize in Background。
-- 如果 stable path 不稳定，换用 compatibility bridge。
+- 如果旧 stable path 或 compatibility 不稳定，成对升级到 KK Depth Hotfix。
 - 需要排查时再开启 `D3D11 bridge candidate diagnostics`，正常使用请关闭。
+- `D3D11 bridge capture stage diagnostics` 也应保持关闭，只在排查需要时开启。
+
+本轮 hotfix 的移动镜头测试在开启和关闭阶段诊断时都正常，但尚未覆盖所有自由视角、插件、驱动组合及真正低内存环境，不能保证这些情况下永不失败。
 
 ## 性能口径
 
-正常截图和录制时应关闭 candidate diagnostics。它会额外采样候选深度纹理，只用于支持日志。
+正常截图和录制时应关闭 candidate diagnostics、capture stage diagnostics 和 environment fingerprint log。升级前已有的配置值会保留，请手动确认。
 
-在同一 KK 环境中，compatibility bridge 相比 stable path 通常有 10% 以内的性能损失。这个损失是为了换取更稳定的多次截图和 VideoExport 深度输出。实际耗时还会受到场景复杂度、贴图尺寸、ScreenshotManager 超采样、MSAA、PNG 编码和输出分辨率影响。
+此前旧 compatibility 与 stable 在单一 KK 环境中的对比约有 10% 以内差距，这不是新 hotfix 的性能保证。新版本增加了 GPU 写入证据查询，实际开销需同场景验证。本轮关闭阶段诊断后 native 捕获窗口缩短，但整帧导出没有加速，主要瓶颈仍是颜色读回与 PNG 编码。不能用不同镜头或不同 KK/KKS 场景给出通用的性能损失百分比。
 
 ## 验证流程
 
